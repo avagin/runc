@@ -52,6 +52,8 @@ type State struct {
 
 	// Container's standard descriptors (std{in,out,err}), needed for checkpoint and restore
 	ExternalDescriptors []string `json:"external_descriptors,omitempty"`
+
+	Console bool `json:"console"`
 }
 
 // A libcontainer container object.
@@ -525,9 +527,16 @@ func (c *linuxContainer) Checkpoint(criuOpts *CriuOpts) error {
 
 	// Write the FD info to a file in the image directory
 
-	fdsJSON, err := json.Marshal(c.initProcess.externalDescriptors())
+	fds, console := c.initProcess.externalDescriptors()
+	fdsJSON, err := json.Marshal(fds)
 	if err != nil {
 		return err
+	}
+	if console {
+		m := &configs.Mount {
+			Destination: "/dev/console",
+		}
+		c.addCriuDumpMount(req, m)
 	}
 
 	err = ioutil.WriteFile(filepath.Join(criuOpts.ImagesDirectory, descriptorsFilename), fdsJSON, 0655)
@@ -662,6 +671,13 @@ func (c *linuxContainer) Restore(process *Process, criuOpts *CriuOpts) error {
 		veth.IfOut = proto.String(i.HostInterfaceName)
 		veth.IfIn = proto.String(i.ContainerInterfaceName)
 		req.Opts.Veths = append(req.Opts.Veths, veth)
+	}
+	if (process.consolePath != "") {
+		m := &configs.Mount {
+			Source: process.consolePath,
+			Destination: "/dev/console",
+		}
+		c.addCriuDumpMount(req, m)
 	}
 
 	// append optional manage cgroups mode
@@ -919,7 +935,7 @@ func (c *linuxContainer) criuNotifications(resp *criurpc.CriuResp, process *Proc
 
 	case notify.GetScript() == "post-restore":
 		pid := notify.GetPid()
-		r, err := newRestoredProcess(int(pid), fds)
+		r, err := newRestoredProcess(int(pid), fds, process.consolePath != "")
 		if err != nil {
 			return err
 		}
@@ -983,6 +999,7 @@ func (c *linuxContainer) currentState() (*State, error) {
 	if err != nil {
 		return nil, newSystemError(err)
 	}
+	fds, console := c.initProcess.externalDescriptors()
 	state := &State{
 		BaseState: BaseState{
 			ID:                   c.ID(),
@@ -992,7 +1009,8 @@ func (c *linuxContainer) currentState() (*State, error) {
 		},
 		CgroupPaths:         c.cgroupManager.GetPaths(),
 		NamespacePaths:      make(map[configs.NamespaceType]string),
-		ExternalDescriptors: c.initProcess.externalDescriptors(),
+		ExternalDescriptors: fds,
+		Console: console,
 	}
 	for _, ns := range c.config.Namespaces {
 		state.NamespacePaths[ns.Type] = ns.GetPath(c.initProcess.pid())

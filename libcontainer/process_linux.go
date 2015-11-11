@@ -35,9 +35,9 @@ type parentProcess interface {
 
 	signal(os.Signal) error
 
-	externalDescriptors() []string
+	externalDescriptors() ([]string, bool)
 
-	setExternalDescriptors(fds []string)
+	setExternalDescriptors(fds []string, console bool)
 }
 
 type setnsProcess struct {
@@ -47,6 +47,7 @@ type setnsProcess struct {
 	cgroupPaths map[string]string
 	config      *initConfig
 	fds         []string
+	console     bool
 	process     *Process
 }
 
@@ -148,12 +149,13 @@ func (p *setnsProcess) pid() int {
 	return p.cmd.Process.Pid
 }
 
-func (p *setnsProcess) externalDescriptors() []string {
-	return p.fds
+func (p *setnsProcess) externalDescriptors() ([]string, bool) {
+	return p.fds, p.console
 }
 
-func (p *setnsProcess) setExternalDescriptors(newFds []string) {
+func (p *setnsProcess) setExternalDescriptors(newFds []string, console bool) {
 	p.fds = newFds
+	p.console = console
 }
 
 type initProcess struct {
@@ -164,6 +166,7 @@ type initProcess struct {
 	manager    cgroups.Manager
 	container  *linuxContainer
 	fds        []string
+	console    bool
 	process    *Process
 }
 
@@ -171,8 +174,8 @@ func (p *initProcess) pid() int {
 	return p.cmd.Process.Pid
 }
 
-func (p *initProcess) externalDescriptors() []string {
-	return p.fds
+func (p *initProcess) externalDescriptors() ([]string, bool) {
+	return p.fds, p.console
 }
 
 func (p *initProcess) start() (err error) {
@@ -191,7 +194,7 @@ func (p *initProcess) start() (err error) {
 	if err != nil {
 		return newSystemError(err)
 	}
-	p.setExternalDescriptors(fds)
+	p.setExternalDescriptors(fds, p.process.consolePath != "")
 
 	// Do this before syncing with child so that no children
 	// can escape the cgroup
@@ -296,8 +299,9 @@ func (p *initProcess) signal(sig os.Signal) error {
 	return syscall.Kill(p.pid(), s)
 }
 
-func (p *initProcess) setExternalDescriptors(newFds []string) {
+func (p *initProcess) setExternalDescriptors(newFds []string, console bool) {
 	p.fds = newFds
+	p.console = console
 }
 
 func getPipeFds(pid int) ([]string, error) {

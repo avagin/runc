@@ -9,7 +9,7 @@ import (
 	"github.com/opencontainers/runc/libcontainer/system"
 )
 
-func newRestoredProcess(pid int, fds []string) (*restoredProcess, error) {
+func newRestoredProcess(pid int, fds []string, console bool) (*restoredProcess, error) {
 	var (
 		err error
 	)
@@ -25,6 +25,7 @@ func newRestoredProcess(pid int, fds []string) (*restoredProcess, error) {
 		proc:             proc,
 		processStartTime: started,
 		fds:              fds,
+		console:          console,
 	}, nil
 }
 
@@ -32,6 +33,7 @@ type restoredProcess struct {
 	proc             *os.Process
 	processStartTime string
 	fds              []string
+	console          bool;
 }
 
 func (p *restoredProcess) start() error {
@@ -68,12 +70,13 @@ func (p *restoredProcess) signal(s os.Signal) error {
 	return p.proc.Signal(s)
 }
 
-func (p *restoredProcess) externalDescriptors() []string {
-	return p.fds
+func (p *restoredProcess) externalDescriptors() ([]string, bool) {
+	return p.fds, p.console
 }
 
-func (p *restoredProcess) setExternalDescriptors(newFds []string) {
+func (p *restoredProcess) setExternalDescriptors(newFds []string, console bool) {
 	p.fds = newFds
+	p.console = console
 }
 
 // nonChildProcess represents a process where the calling process is not
@@ -83,6 +86,7 @@ type nonChildProcess struct {
 	processPid       int
 	processStartTime string
 	fds              []string
+	console          bool
 }
 
 func (p *nonChildProcess) start() error {
@@ -113,10 +117,11 @@ func (p *nonChildProcess) signal(s os.Signal) error {
 	return proc.Signal(s)
 }
 
-func (p *nonChildProcess) externalDescriptors() []string {
-	return p.fds
+func (p *nonChildProcess) externalDescriptors() ([]string, bool) {
+	return p.fds, p.console
 }
 
-func (p *nonChildProcess) setExternalDescriptors(newFds []string) {
+func (p *nonChildProcess) setExternalDescriptors(newFds []string, console bool) {
 	p.fds = newFds
+	p.console = console
 }
