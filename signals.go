@@ -88,10 +88,9 @@ func (h *signalHandler) forward(process *libcontainer.Process) (int, error) {
 func (h *signalHandler) reap() (exits []exit, err error) {
 	var (
 		ws  syscall.WaitStatus
-		rus syscall.Rusage
 	)
 	for {
-		pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, &rus)
+		pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
 		if err != nil {
 			if err == syscall.ECHILD {
 				return exits, nil

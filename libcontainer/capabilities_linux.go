@@ -4,7 +4,6 @@ package libcontainer
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/syndtr/gocapability/capability"
@@ -39,7 +38,7 @@ func newCapWhitelist(caps []string) (*whitelist, error) {
 		}
 		l = append(l, v)
 	}
-	pid, err := capability.NewPid(os.Getpid())
+	pid, err := capability.NewPid(0)
 	if err != nil {
 		return nil, err
 	}
