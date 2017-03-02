@@ -1066,24 +1066,7 @@ func (c *linuxContainer) criuSwrk(process *Process, req *criurpc.CriuReq, opts *
 			continue
 		case t == criurpc.CriuReqType_RESTORE:
 		case t == criurpc.CriuReqType_DUMP:
-			break
 		case t == criurpc.CriuReqType_PRE_DUMP:
-			// In pre-dump mode CRIU is in a loop and waits for
-			// the final DUMP command.
-			// The current runc pre-dump approach, however, is
-			// start criu in PRE_DUMP once for a single pre-dump
-			// and not the whole series of pre-dump, pre-dump, ...m, dump
-			// If we got the message CriuReqType_PRE_DUMP it means
-			// CRIU was successful and we need to forcefully stop CRIU
-			logrus.Debugf("PRE_DUMP finished. Send close signal to CRIU service")
-			criuClient.Close()
-			// Process status won't be success, because one end of sockets is closed
-			_, err := cmd.Process.Wait()
-			if err != nil {
-				logrus.Debugf("After PRE_DUMP CRIU exiting failed")
-				return err
-			}
-			return nil
 		default:
 			return fmt.Errorf("unable to parse the response %s", resp.String())
 		}
@@ -1091,13 +1074,20 @@ func (c *linuxContainer) criuSwrk(process *Process, req *criurpc.CriuReq, opts *
 		break
 	}
 
+	syscall.Shutdown(fds[0], syscall.SHUT_WR)
 	// cmd.Wait() waits cmd.goroutines which are used for proxying file descriptors.
 	// Here we want to wait only the CRIU process.
 	st, err := cmd.Process.Wait()
 	if err != nil {
 		return err
 	}
-	if !st.Success() {
+
+	// In pre-dump mode CRIU is in a loop and waits for
+	// the final DUMP command.
+	// The current runc pre-dump approach, however, is
+	// start criu in PRE_DUMP once for a single pre-dump
+	// and not the whole series of pre-dump, pre-dump, ...m, dump
+	if !st.Success() && *req.Type != criurpc.CriuReqType_PRE_DUMP {
 		return fmt.Errorf("criu failed: %s\nlog file: %s", st.String(), logPath)
 	}
 	return nil
