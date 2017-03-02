@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -657,20 +658,21 @@ func (c *linuxContainer) Checkpoint(criuOpts *CriuOpts) error {
 	defer imageDir.Close()
 
 	rpcOpts := criurpc.CriuOpts{
-		ImagesDirFd:    proto.Int32(int32(imageDir.Fd())),
-		WorkDirFd:      proto.Int32(int32(workDir.Fd())),
-		LogLevel:       proto.Int32(4),
-		LogFile:        proto.String("dump.log"),
-		Root:           proto.String(c.config.Rootfs),
-		ManageCgroups:  proto.Bool(true),
-		NotifyScripts:  proto.Bool(true),
-		Pid:            proto.Int32(int32(c.initProcess.pid())),
-		ShellJob:       proto.Bool(criuOpts.ShellJob),
-		LeaveRunning:   proto.Bool(criuOpts.LeaveRunning),
-		TcpEstablished: proto.Bool(criuOpts.TcpEstablished),
-		ExtUnixSk:      proto.Bool(criuOpts.ExternalUnixConnections),
-		FileLocks:      proto.Bool(criuOpts.FileLocks),
-		EmptyNs:        proto.Uint32(criuOpts.EmptyNs),
+		ImagesDirFd:     proto.Int32(int32(imageDir.Fd())),
+		WorkDirFd:       proto.Int32(int32(workDir.Fd())),
+		LogLevel:        proto.Int32(4),
+		LogFile:         proto.String("dump.log"),
+		Root:            proto.String(c.config.Rootfs),
+		ManageCgroups:   proto.Bool(true),
+		NotifyScripts:   proto.Bool(true),
+		Pid:             proto.Int32(int32(c.initProcess.pid())),
+		ShellJob:        proto.Bool(criuOpts.ShellJob),
+		LeaveRunning:    proto.Bool(criuOpts.LeaveRunning),
+		TcpEstablished:  proto.Bool(criuOpts.TcpEstablished),
+		ExtUnixSk:       proto.Bool(criuOpts.ExternalUnixConnections),
+		FileLocks:       proto.Bool(criuOpts.FileLocks),
+		EmptyNs:         proto.Uint32(criuOpts.EmptyNs),
+		OrphanPtsMaster: proto.Bool(true),
 	}
 
 	// append optional criu opts, e.g., page-server and port
@@ -838,20 +840,21 @@ func (c *linuxContainer) Restore(process *Process, criuOpts *CriuOpts) error {
 	req := &criurpc.CriuReq{
 		Type: &t,
 		Opts: &criurpc.CriuOpts{
-			ImagesDirFd:    proto.Int32(int32(imageDir.Fd())),
-			WorkDirFd:      proto.Int32(int32(workDir.Fd())),
-			EvasiveDevices: proto.Bool(true),
-			LogLevel:       proto.Int32(4),
-			LogFile:        proto.String("restore.log"),
-			RstSibling:     proto.Bool(true),
-			Root:           proto.String(root),
-			ManageCgroups:  proto.Bool(true),
-			NotifyScripts:  proto.Bool(true),
-			ShellJob:       proto.Bool(criuOpts.ShellJob),
-			ExtUnixSk:      proto.Bool(criuOpts.ExternalUnixConnections),
-			TcpEstablished: proto.Bool(criuOpts.TcpEstablished),
-			FileLocks:      proto.Bool(criuOpts.FileLocks),
-			EmptyNs:        proto.Uint32(criuOpts.EmptyNs),
+			ImagesDirFd:     proto.Int32(int32(imageDir.Fd())),
+			WorkDirFd:       proto.Int32(int32(workDir.Fd())),
+			EvasiveDevices:  proto.Bool(true),
+			LogLevel:        proto.Int32(4),
+			LogFile:         proto.String("restore.log"),
+			RstSibling:      proto.Bool(true),
+			Root:            proto.String(root),
+			ManageCgroups:   proto.Bool(true),
+			NotifyScripts:   proto.Bool(true),
+			ShellJob:        proto.Bool(criuOpts.ShellJob),
+			ExtUnixSk:       proto.Bool(criuOpts.ExternalUnixConnections),
+			TcpEstablished:  proto.Bool(criuOpts.TcpEstablished),
+			FileLocks:       proto.Bool(criuOpts.FileLocks),
+			EmptyNs:         proto.Uint32(criuOpts.EmptyNs),
+			OrphanPtsMaster: proto.Bool(true),
 		},
 	}
 
@@ -947,6 +950,11 @@ func (c *linuxContainer) criuSwrk(process *Process, req *criurpc.CriuReq, opts *
 
 	logPath := filepath.Join(opts.WorkDirectory, req.GetOpts().GetLogFile())
 	criuClient := os.NewFile(uintptr(fds[0]), "criu-transport-client")
+	criuClientCon, err := net.FileConn(criuClient)
+	if err != nil {
+		return err
+	}
+
 	criuServer := os.NewFile(uintptr(fds[1]), "criu-transport-server")
 	defer criuClient.Close()
 	defer criuServer.Close()
@@ -1006,14 +1014,15 @@ func (c *linuxContainer) criuSwrk(process *Process, req *criurpc.CriuReq, opts *
 	if err != nil {
 		return err
 	}
-	_, err = criuClient.Write(data)
+	_, err = criuClientCon.Write(data)
 	if err != nil {
 		return err
 	}
 
 	buf := make([]byte, 10*4096)
+	oob := make([]byte, 4096)
 	for true {
-		n, err := criuClient.Read(buf)
+		n, oobn, _, _, err := criuClientCon.(*net.UnixConn).ReadMsgUnix(buf, oob)
 		if err != nil {
 			return err
 		}
@@ -1037,7 +1046,7 @@ func (c *linuxContainer) criuSwrk(process *Process, req *criurpc.CriuReq, opts *
 		t := resp.GetType()
 		switch {
 		case t == criurpc.CriuReqType_NOTIFY:
-			if err := c.criuNotifications(resp, process, opts, extFds); err != nil {
+			if err := c.criuNotifications(resp, process, opts, extFds, oob[:oobn]); err != nil {
 				return err
 			}
 			t = criurpc.CriuReqType_NOTIFY
@@ -1121,11 +1130,12 @@ func unlockNetwork(config *configs.Config) error {
 	return nil
 }
 
-func (c *linuxContainer) criuNotifications(resp *criurpc.CriuResp, process *Process, opts *CriuOpts, fds []string) error {
+func (c *linuxContainer) criuNotifications(resp *criurpc.CriuResp, process *Process, opts *CriuOpts, fds []string, oob []byte) error {
 	notify := resp.GetNotify()
 	if notify == nil {
 		return fmt.Errorf("invalid response: %s", resp.String())
 	}
+	logrus.Debugf("notify: %s\n", notify.GetScript())
 	switch {
 	case notify.GetScript() == "post-dump":
 		f, err := os.Create(filepath.Join(c.root, "checkpoint"))
@@ -1177,6 +1187,20 @@ func (c *linuxContainer) criuNotifications(resp *criurpc.CriuResp, process *Proc
 			if !os.IsNotExist(err) {
 				logrus.Error(err)
 			}
+		}
+	case notify.GetScript() == "orphan-pts-master":
+		scm, err := syscall.ParseSocketControlMessage(oob)
+		if err != nil {
+			return err
+		}
+		fds, err := syscall.ParseUnixRights(&scm[0])
+
+		master := os.NewFile(uintptr(fds[0]), "orphan-pts-master")
+		defer master.Close()
+
+		// While we can access console.master, using the API is a good idea.
+		if err := utils.SendFd(process.ConsoleSocket, master); err != nil {
+			return err
 		}
 	}
 	return nil
