@@ -34,9 +34,11 @@ RUN cd /tmp \
 
 # install criu
 ENV CRIU_VERSION 2.11.1
+COPY tests/hacks/0001-criu-allow-to-ignore-ipv6-if-CRIU_NOIPV6-is-set.patch /tmp/
 RUN mkdir -p /usr/src/criu \
     && curl -sSL https://github.com/xemul/criu/archive/v${CRIU_VERSION}.tar.gz | tar -v -C /usr/src/criu/ -xz --strip-components=1 \
     && cd /usr/src/criu \
+    && cat /tmp/0001-criu-allow-to-ignore-ipv6-if-CRIU_NOIPV6-is-set.patch | patch -p1 \
     && make install-criu \
     && rm -rf /usr/src/criu
 
@@ -48,6 +50,8 @@ RUN mkdir -p /go/src/github.com/mvdan \
     && git checkout -f v0.4.0 \
     && go install ./cmd/shfmt \
     && rm -rf /go/src/github.com/mvdan
+
+ENV CRIU_NOIPV6 1
 
 # setup a playground for us to spawn containers in
 ENV ROOTFS /busybox
