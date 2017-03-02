@@ -179,8 +179,9 @@ type runner struct {
 	pidFile         string
 	consoleSocket   string
 	container       libcontainer.Container
-	create          bool
+	action          CtAct
 	notifySocket    *notifySocket
+	criuOpts        *libcontainer.CriuOpts
 }
 
 func (r *runner) run(config *specs.Process) (int, error) {
@@ -212,12 +213,8 @@ func (r *runner) run(config *specs.Process) (int, error) {
 		return -1, err
 	}
 	var (
-		detach  = r.detach || r.create
-		startFn = r.container.Start
+		detach  = r.detach || (r.action == CT_ACT_CREATE)
 	)
-	if !r.create {
-		startFn = r.container.Run
-	}
 	// Setting up IO is a two stage process. We need to modify process to deal
 	// with detaching containers, and then we get a tty after the container has
 	// started.
@@ -228,7 +225,18 @@ func (r *runner) run(config *specs.Process) (int, error) {
 		return -1, err
 	}
 	defer tty.Close()
-	if err = startFn(process); err != nil {
+
+	switch r.action {
+	case CT_ACT_CREATE:
+		err = r.container.Start(process)
+	case CT_ACT_RESTORE:
+		err = r.container.Restore(process, r.criuOpts)
+	case CT_ACT_RUN:
+		err = r.container.Run(process)
+	default:
+		panic("Unknown action")
+	}
+	if err != nil {
 		r.destroy()
 		return -1, err
 	}
@@ -299,7 +307,7 @@ func (r *runner) newProcess(p specs.Process) (*libcontainer.Process, error) {
 }
 
 func (r *runner) checkTerminal(config *specs.Process) error {
-	detach := r.detach || r.create
+	detach := r.detach || (r.action == CT_ACT_CREATE)
 	// Check command-line for sanity.
 	if detach && config.Terminal && r.consoleSocket == "" {
 		return fmt.Errorf("cannot allocate tty if runc will detach without setting console socket")
@@ -323,7 +331,15 @@ func validateProcessSpec(spec *specs.Process) error {
 	return nil
 }
 
-func startContainer(context *cli.Context, spec *specs.Spec, create bool) (int, error) {
+type CtAct uint8
+
+const (
+	CT_ACT_CREATE CtAct = iota + 1
+	CT_ACT_RUN
+	CT_ACT_RESTORE
+)
+
+func startContainer(context *cli.Context, spec *specs.Spec, action CtAct, criuOpts *libcontainer.CriuOpts) (int, error) {
 	id := context.Args().First()
 	if id == "" {
 		return -1, errEmptyID
@@ -358,7 +374,8 @@ func startContainer(context *cli.Context, spec *specs.Spec, create bool) (int, e
 		detach:          context.Bool("detach"),
 		pidFile:         context.String("pid-file"),
 		preserveFDs:     context.Int("preserve-fds"),
-		create:          create,
+		action:          action,
+		criuOpts:        criuOpts,
 	}
 	return r.run(&spec.Process)
 }
