@@ -1,0 +1,26 @@
+From 8a9b1d0e6929d296254a8892e553621d76810e87 Mon Sep 17 00:00:00 2001
+From: Andrei Vagin <avagin@openvz.org>
+Date: Thu, 2 Mar 2017 14:44:18 -0800
+Subject: [PATCH] criu: allow to ignore ipv6 if CRIU_NOIPV6 is set
+
+Signed-off-by: Andrei Vagin <avagin@openvz.org>
+---
+ criu/kerndat.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/criu/kerndat.c b/criu/kerndat.c
+index 162ac28..216afe0 100644
+--- a/criu/kerndat.c
++++ b/criu/kerndat.c
+@@ -433,6 +433,8 @@ out:
+ 
+ static int get_ipv6()
+ {
++	if (getenv("CRIU_NOIPV6"))
++		return 0;
+ 	if (access("/proc/sys/net/ipv6", F_OK) < 0) {
+ 		if (errno == ENOENT) {
+ 			pr_debug("ipv6 is disabled\n");
+-- 
+2.9.3
+
