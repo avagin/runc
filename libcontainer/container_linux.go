@@ -673,6 +673,7 @@ func (c *linuxContainer) Checkpoint(criuOpts *CriuOpts) error {
 		FileLocks:       proto.Bool(criuOpts.FileLocks),
 		EmptyNs:         proto.Uint32(criuOpts.EmptyNs),
 		OrphanPtsMaster: proto.Bool(true),
+		FreezeCgroup:    proto.String(c.cgroupManager.GetPaths()["freezer"]),
 	}
 
 	// append optional criu opts, e.g., page-server and port
@@ -855,6 +856,7 @@ func (c *linuxContainer) Restore(process *Process, criuOpts *CriuOpts) error {
 			FileLocks:       proto.Bool(criuOpts.FileLocks),
 			EmptyNs:         proto.Uint32(criuOpts.EmptyNs),
 			OrphanPtsMaster: proto.Bool(true),
+			FreezeCgroup:    proto.String(c.cgroupManager.GetPaths()["freezer"]),
 		},
 	}
 
