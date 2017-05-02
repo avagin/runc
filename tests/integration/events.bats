@@ -20,7 +20,7 @@ function teardown() {
   [ "$status" -eq 0 ]
 
   # check state
-  wait_for_container 15 1 test_busybox
+  testcontainer test_busybox running
 
   # generate stats
   runc events --stats test_busybox
@@ -38,7 +38,7 @@ function teardown() {
   [ "$status" -eq 0 ]
 
   # check state
-  wait_for_container 15 1 test_busybox
+  testcontainer test_busybox running
 
   # spawn two sub processes (shells)
   # the first sub process is an event logger that sends stats events to events.log
@@ -68,7 +68,7 @@ function teardown() {
   [ "$status" -eq 0 ]
 
   # check state
-  wait_for_container 15 1 test_busybox
+  testcontainer test_busybox running
 
   # spawn two sub processes (shells)
   # the first sub process is an event logger that sends stats events to events.log once a second
@@ -97,7 +97,7 @@ function teardown() {
   [ "$status" -eq 0 ]
 
   # check state
-  wait_for_container 15 1 test_busybox
+  testcontainer test_busybox running
 
   #prove there is no carry over of events.log from a prior test
   [ ! -e events.log ]

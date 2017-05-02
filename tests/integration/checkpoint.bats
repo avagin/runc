@@ -22,11 +22,7 @@ function teardown() {
   [ "$status" -eq 0 ]
 
   # check state
-  wait_for_container 15 1 test_busybox
-
-  runc state test_busybox
-  [ "$status" -eq 0 ]
-  [[ "${output}" == *"running"* ]]
+  testcontainer test_busybox running
 
   for i in `seq 2`; do
 	  # checkpoint the running container

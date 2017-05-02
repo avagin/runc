@@ -16,7 +16,7 @@ function teardown() {
   runc run -d --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
 
-  wait_for_container 15 1 test_busybox
+  testcontainer test_busybox running
 
   runc exec test_busybox echo Hello from exec
   [ "$status" -eq 0 ]
@@ -29,7 +29,7 @@ function teardown() {
   runc run -d --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
 
-  wait_for_container 15 1 test_busybox
+  testcontainer test_busybox running
 
   runc exec --pid-file pid.txt test_busybox echo Hello from exec
   [ "$status" -eq 0 ]
@@ -56,7 +56,7 @@ function teardown() {
   runc run -d -b $BUSYBOX_BUNDLE --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
 
-  wait_for_container 15 1 test_busybox
+  testcontainer test_busybox running
 
   runc exec --pid-file pid.txt test_busybox echo Hello from exec
   [ "$status" -eq 0 ]
@@ -77,7 +77,7 @@ function teardown() {
   runc run -d --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
 
-  wait_for_container 15 1 test_busybox
+  testcontainer test_busybox running
 
   runc exec test_busybox ls -la
   [ "$status" -eq 0 ]
@@ -91,7 +91,7 @@ function teardown() {
   runc run -d --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
 
-  wait_for_container 15 1 test_busybox
+  testcontainer test_busybox running
 
   runc exec --cwd /bin test_busybox pwd
   [ "$status" -eq 0 ]
@@ -103,7 +103,7 @@ function teardown() {
   runc run -d --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
 
-  wait_for_container 15 1 test_busybox
+  testcontainer test_busybox running
 
   runc exec --env RUNC_EXEC_TEST=true test_busybox env
   [ "$status" -eq 0 ]
@@ -119,7 +119,7 @@ function teardown() {
   runc run -d --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
 
-  wait_for_container 15 1 test_busybox
+  testcontainer test_busybox running
 
   runc exec --user 1000:1000 test_busybox id
   [ "$status" -eq 0 ]
