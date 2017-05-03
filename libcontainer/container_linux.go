@@ -1242,6 +1242,12 @@ func (c *linuxContainer) criuNotifications(resp *criurpc.CriuResp, process *Proc
 		}
 	case notify.GetScript() == "setup-namespaces":
 		if c.config.Hooks != nil {
+			logrus.Debugf("=========== setup-namespaces ============");
+			cmd := exec.Command("nsenter", "-n", "-t", fmt.Sprintf("%d", notify.GetPid()), "ip", "a")
+			stdoutStderr, err := cmd.CombinedOutput()
+			logrus.Debugf("%s", err);
+			logrus.Debugf("%s", stdoutStderr);
+			logrus.Debugf("===");
 			s := configs.HookState{
 				Version: c.config.Version,
 				ID:      c.id,
@@ -1253,6 +1259,12 @@ func (c *linuxContainer) criuNotifications(resp *criurpc.CriuResp, process *Proc
 					return newSystemErrorWithCausef(err, "running prestart hook %d", i)
 				}
 			}
+			logrus.Debugf("=========== setup-namespaces ============");
+			cmd = exec.Command("nsenter", "-n", "-t", fmt.Sprintf("%d", notify.GetPid()), "ip", "a")
+			stdoutStderr, err = cmd.CombinedOutput()
+			logrus.Debugf("%s", err);
+			logrus.Debugf("%s", stdoutStderr);
+			logrus.Debugf("===");
 		}
 	case notify.GetScript() == "post-restore":
 		pid := notify.GetPid()
