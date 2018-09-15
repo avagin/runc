@@ -260,7 +260,7 @@ func TestParseCgroupString(t *testing.T) {
 	}
 
 	for ndx, testCase := range testCases {
-		out, err := parseCgroupFromReader(strings.NewReader(testCase.input))
+		out, err := parseCgroupFromReader(strings.NewReader(testCase.input), true)
 		if err != nil {
 			if testCase.expectedError == nil || testCase.expectedError.Error() != err.Error() {
 				t.Errorf("%v: expected error %v, got error %v", ndx, testCase.expectedError, err)

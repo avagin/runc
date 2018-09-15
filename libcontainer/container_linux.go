@@ -1283,7 +1283,7 @@ func (c *linuxContainer) criuApplyCgroups(pid int, req *criurpc.CriuReq) error {
 	}
 
 	path := fmt.Sprintf("/proc/%d/cgroup", pid)
-	cgroupsPaths, err := cgroups.ParseCgroupFile(path)
+	cgroupsPaths, err := cgroups.ParseCgroupFile(path, false)
 	if err != nil {
 		return err
 	}

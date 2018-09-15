@@ -7,7 +7,7 @@ import (
 )
 
 func TestParseCgroups(t *testing.T) {
-	cgroups, err := ParseCgroupFile("/proc/self/cgroup")
+	cgroups, err := ParseCgroupFile("/proc/self/cgroup", true)
 	if err != nil {
 		t.Fatal(err)
 	}

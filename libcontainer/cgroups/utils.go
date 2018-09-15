@@ -58,7 +58,7 @@ func FindCgroupMountpointAndRoot(subsystem string) (string, string, error) {
 }
 
 func isSubsystemAvailable(subsystem string) bool {
-	cgroups, err := ParseCgroupFile("/proc/self/cgroup")
+	cgroups, err := ParseCgroupFile("/proc/self/cgroup", true)
 	if err != nil {
 		return false
 	}
@@ -180,7 +180,7 @@ func GetCgroupMounts(all bool) ([]Mount, error) {
 	}
 	defer f.Close()
 
-	allSubsystems, err := ParseCgroupFile("/proc/self/cgroup")
+	allSubsystems, err := ParseCgroupFile("/proc/self/cgroup", true)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +220,7 @@ func GetAllSubsystems() ([]string, error) {
 
 // GetOwnCgroup returns the relative path to the cgroup docker is running in.
 func GetOwnCgroup(subsystem string) (string, error) {
-	cgroups, err := ParseCgroupFile("/proc/self/cgroup")
+	cgroups, err := ParseCgroupFile("/proc/self/cgroup", true)
 	if err != nil {
 		return "", err
 	}
@@ -238,7 +238,7 @@ func GetOwnCgroupPath(subsystem string) (string, error) {
 }
 
 func GetInitCgroup(subsystem string) (string, error) {
-	cgroups, err := ParseCgroupFile("/proc/1/cgroup")
+	cgroups, err := ParseCgroupFile("/proc/1/cgroup", true)
 	if err != nil {
 		return "", err
 	}
@@ -297,18 +297,18 @@ func readProcsFile(dir string) ([]int, error) {
 
 // ParseCgroupFile parses the given cgroup file, typically from
 // /proc/<pid>/cgroup, into a map of subgroups to cgroup names.
-func ParseCgroupFile(path string) (map[string]string, error) {
+func ParseCgroupFile(path string, split bool) (map[string]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	return parseCgroupFromReader(f)
+	return parseCgroupFromReader(f, split)
 }
 
 // helper function for ParseCgroupFile to make testing easier
-func parseCgroupFromReader(r io.Reader) (map[string]string, error) {
+func parseCgroupFromReader(r io.Reader, split bool) (map[string]string, error) {
 	s := bufio.NewScanner(r)
 	cgroups := make(map[string]string)
 
@@ -325,8 +325,12 @@ func parseCgroupFromReader(r io.Reader) (map[string]string, error) {
 			return nil, fmt.Errorf("invalid cgroup entry: must contain at least two colons: %v", text)
 		}
 
-		for _, subs := range strings.Split(parts[1], ",") {
-			cgroups[subs] = parts[2]
+		if split {
+			for _, subs := range strings.Split(parts[1], ",") {
+				cgroups[subs] = parts[2]
+			}
+		} else {
+			cgroups[parts[1]] = parts[2]
 		}
 	}
 	if err := s.Err(); err != nil {
