@@ -292,3 +292,47 @@ function teardown() {
   ip netns del $ns_name
 }
 
+@test "checkpoint and restore with container specific CRIU config" {
+  # XXX: currently criu require root containers.
+  requires criu root
+
+  tmp=`mktemp`
+  # This adds the annotation 'org.criu.config' to set a container
+  # specific CRIU config file.
+  sed -i "s;\"process\";\"annotations\":{\"org.criu.config\": \"$tmp\"},\"process\";" config.json
+  # Tell CRIU to run with verbosity=0
+  echo "verbosity=0" > $tmp
+
+  runc run -d --console-socket $CONSOLE_SOCKET test_busybox
+  [ "$status" -eq 0 ]
+
+  testcontainer test_busybox running
+
+  # checkpoint the running container
+  runc --criu "$CRIU" checkpoint --work-path ./work-dir test_busybox
+  [ "$status" -eq 0 ]
+  # Using verbosity=0 should create really small log files.
+  # Because CRIU's criu.kdat files do not seem to work on travis
+  # 'Warn  (criu/kerndat.c:881): Can't keep kdat cache on non-tempfs'
+  # there will be at least 37 lines. A full dump of the container
+  # in this test will generate over 1000 lines. So 45 is still
+  # much smaller and verbosity=0 works.
+  lines=`wc -l ./work-dir/dump.log | cut -d\  -f1`
+  [ "$lines" -lt "45" ]
+
+  # after checkpoint busybox is no longer running
+  runc state test_busybox
+  [ "$status" -ne 0 ]
+
+  # restore from checkpoint
+  runc --criu "$CRIU" restore -d --work-path ./work-dir --console-socket $CONSOLE_SOCKET test_busybox
+  [ "$status" -eq 0 ]
+  # Using verbosity=0 should create really small log files
+  lines=`wc -l ./work-dir/restore.log | cut -d\  -f1`
+  [ "$lines" -lt "45" ]
+
+  # busybox should be back up and running
+  testcontainer test_busybox running
+  rm -f $tmp
+}
+
