@@ -451,14 +451,14 @@ function simple_cr() {
 	local execed_pid=""
 	for _ in $(seq 2); do
 		# checkpoint the running container
-		runc "$@" checkpoint --work-path ./work-dir test_busybox
+		runc checkpoint --work-path ./work-dir test_busybox
 		[ "$status" -eq 0 ]
 
 		# after checkpoint busybox is no longer running
 		testcontainer test_busybox checkpointed
 
 		# restore from checkpoint
-		runc "$@" restore -d --work-path ./work-dir --console-socket "$CONSOLE_SOCKET" test_busybox
+		runc restore -d --work-path ./work-dir --console-socket "$CONSOLE_SOCKET" test_busybox
 		[ "$status" -eq 0 ]
 
 		# busybox should be back up and running
