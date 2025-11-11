@@ -86,6 +86,12 @@ jobs:
         rm -rf ~/criu
         criu --version
 
+    - name: Setup upterm session
+      uses: owenthereal/action-upterm@v1
+      with:
+        wait-timeout-minutes: 60
+
+
     - name: install go ${{ matrix.go-version }}
       uses: actions/setup-go@v6
       with:
