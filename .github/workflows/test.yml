@@ -83,13 +83,7 @@ jobs:
         git clone --depth 1 --branch ${{ matrix.criu }} --single-branch \
           https://github.com/checkpoint-restore/criu.git ~/criu
         (cd ~/criu && sudo make -j $(nproc) install-criu)
-        rm -rf ~/criu
         criu --version
-
-    - name: Setup upterm session
-      uses: owenthereal/action-upterm@v1
-      with:
-        wait-timeout-minutes: 60
 
 
     - name: install go ${{ matrix.go-version }}
@@ -124,6 +118,11 @@ jobs:
 
     - name: integration test (fs driver)
       run: sudo -E PATH="$PATH" script -e -c 'make local${{ matrix.rootless }}integration'
+
+    - name: Setup upterm session
+      uses: owenthereal/action-upterm@v1
+      with:
+        wait-timeout-minutes: 60
 
     - name: integration test (systemd driver)
       run: |
