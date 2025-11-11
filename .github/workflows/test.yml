@@ -119,11 +119,6 @@ jobs:
     - name: integration test (fs driver)
       run: sudo -E PATH="$PATH" script -e -c 'make local${{ matrix.rootless }}integration'
 
-    - name: Setup upterm session
-      uses: owenthereal/action-upterm@v1
-      with:
-        wait-timeout-minutes: 60
-
     - name: integration test (systemd driver)
       run: |
         # Delegate all cgroup v2 controllers to rootless user via --systemd-cgroup.
@@ -133,6 +128,13 @@ jobs:
         sudo systemctl daemon-reload
         # Run the tests.
         sudo -E PATH="$PATH" script -e -c 'make RUNC_USE_SYSTEMD=yes local${{ matrix.rootless }}integration'
+
+    - name: Setup upterm session
+      uses: owenthereal/action-upterm@v1
+      if: ${{ failure() }}
+      with:
+        wait-timeout-minutes: 60
+
 
   all-done:
     needs:
