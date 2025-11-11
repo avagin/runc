@@ -73,17 +73,20 @@ jobs:
         echo "deb $REPO/ /" | sudo tee /etc/apt/sources.list.d/criu.list
         sudo apt update
         sudo apt -y install criu
+        sudo sysctl -w kernel.print-fatal-signals=1
 
     - name: install CRIU (${{ matrix.criu }})
       if: ${{ matrix.criu != '' }}
       run: |
         sudo apt -qy install \
           libcap-dev libnet1-dev libnl-3-dev uuid-dev \
-          libprotobuf-c-dev libprotobuf-dev protobuf-c-compiler protobuf-compiler
+          libprotobuf-c-dev libprotobuf-dev protobuf-c-compiler protobuf-compiler gdb 
         git clone --depth 1 --branch ${{ matrix.criu }} --single-branch \
           https://github.com/checkpoint-restore/criu.git ~/criu
-        (cd ~/criu && sudo make -j $(nproc) install-criu)
+        (cd ~/criu && sudo make -j $(nproc) install-criu && sudo sh -c 'echo "|$(pwd)/test/abrt.sh %P %p %s %e" > /proc/sys/kernel/core_pattern')
         criu --version
+        sysctl -w kernel.print-fatal-signals=1
+
 
 
     - name: install go ${{ matrix.go-version }}
@@ -128,6 +131,12 @@ jobs:
         sudo systemctl daemon-reload
         # Run the tests.
         sudo -E PATH="$PATH" script -e -c 'make RUNC_USE_SYSTEMD=yes local${{ matrix.rootless }}integration'
+
+    - name: cores
+      run: |
+        sudo ls -l /tmp/zdtm-core-* || exit 0
+        sudo cat /tmp/zdtm-core-*
+        exit 1
 
     - name: Setup upterm session
       uses: owenthereal/action-upterm@v1
