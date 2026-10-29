@@ -1118,7 +1118,7 @@ func (c *Container) bootstrapData(cloneFlags uintptr, nsMaps map[configs.Namespa
 			if c.config.RootlessEUID {
 				// We resolve the paths for new{u,g}idmap from
 				// the context of runc to avoid doing a path
-				// lookup in the nsexec context.
+				// lookup in the nsenter context.
 				if path, err := exec.LookPath("newuidmap"); err == nil {
 					r.AddData(&Bytemsg{
 						Type:  UidmapPathAttr,

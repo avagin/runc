@@ -1,0 +1,556 @@
+package nsenter
+
+import (
+	"runtime"
+	"syscall"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+)
+
+// These functions are implemented in the runtime package and are used by
+// syscall.forkAndExecInChild. See also gvisor's pkg/sentry/platform/ptrace.
+
+//go:linkname beforeFork syscall.runtime_BeforeFork
+func beforeFork()
+
+//go:linkname afterFork syscall.runtime_AfterFork
+func afterFork()
+
+//go:linkname afterForkInChild syscall.runtime_AfterForkInChild
+func afterForkInChild()
+
+// Synchronisation values. The values are the same as in former nsexec.c.
+const (
+	syncUsermapPls     = 0x40 // Request parent to map our users.
+	syncUsermapAck     = 0x41 // Mapping finished by the parent.
+	syncRecvPidPls     = 0x42 // Tell parent we're sending the PID.
+	syncRecvPidAck     = 0x43 // PID was correctly received by parent.
+	syncGrandchild     = 0x44 // The grandchild is ready to run.
+	syncChildFinish    = 0x45 // The child or grandchild has finished.
+	syncTimeOffsetsPls = 0x46 // Request parent to write timens offsets.
+	syncTimeOffsetsAck = 0x47 // Timens offsets were written.
+	syncError          = 0x48 // The child or grandchild has failed.
+)
+
+// Error steps, sent by stage-1 or stage-2 along with syncError.
+const (
+	stepNone = iota
+	stepSyncWrite
+	stepSyncRead
+	stepSyncUnexpected
+	stepSetns
+	stepJoinNamespaces
+	stepSetresuidUserns
+	stepUnshareUserns
+	stepSetDumpable
+	stepUnshare
+	stepCloneStage2
+	stepSetsid
+	stepSetuid
+	stepSetgid
+	stepSetgroups
+	stepSetrlimit
+	stepNondumpable
+	stepExec
+)
+
+// How stage-2 ensures that the process is not dumpable right after execveat
+// (reported to stage-0 along with syncChildFinish).
+const (
+	nondumpNone = iota // Not needed (or not possible, if not required).
+	nondumpCaps        // A capability is regained on exec.
+	nondumpGid         // The real and effective gids differ.
+)
+
+// syncMsg is a fixed-size message used for all synchronisation between
+// stage-0, stage-1 and stage-2.
+type syncMsg struct {
+	Type uint32
+	Arg0 uint32 // pid, errno, or received sync type
+	Arg1 uint32 // error step
+	Arg2 uint32 // step-specific argument
+}
+
+const syncMsgSize = unsafe.Sizeof(syncMsg{})
+
+type rlimit64 struct {
+	Cur uint64
+	Max uint64
+}
+
+// childArgs contains everything stage-1 and stage-2 need. It is fully
+// prepared by stage-0 before the fork, because the forked children are not
+// allowed to allocate memory.
+type childArgs struct {
+	// syncChild[0] is used by stage-1, syncChild[1] by stage-0.
+	syncChild [2]int
+	// syncGrandchild[0] is used by stage-2, syncGrandchild[1] by stage-0.
+	syncGrandchild [2]int
+
+	// Namespaces to join (pre-opened by stage-0).
+	nsFds   []int
+	nsTypes []uintptr
+
+	// Namespaces to create, except CLONE_NEWUSER.
+	cloneFlags uintptr
+	// Whether to create a new user namespace.
+	newUserns bool
+	// Whether the process is set as non-dumpable (and so has to be set
+	// as dumpable temporarily for the parent to write uid/gid maps).
+	toggleDumpable bool
+	// Whether to ask stage-0 to write time namespace offsets.
+	timens bool
+
+	// Whether to call setgroups(0, NULL) in stage-2.
+	setgroups bool
+	// Original RLIMIT_NOFILE to be restored in stage-2 before execveat.
+	restoreNofile bool
+	nofile        rlimit64
+
+	// Whether stage-2 must fail if it can not make sure the re-executed
+	// process is non-dumpable from the very start.
+	nondumpRequired bool
+	// A gid (other than 0) valid in the container user namespace, to be
+	// used as a real gid for execveat if the capability-based method is
+	// not available, or -1.
+	nondumpGid int
+
+	// execveat(2) arguments for stage-2.
+	exeFd     int
+	argv      []*byte
+	envv      []*byte
+	emptyPath *byte
+
+	// Process names (PR_SET_NAME), NUL-terminated.
+	stage1Name *byte
+	stage2Name *byte
+}
+
+const (
+	linuxCapabilityVersion3 = 0x20080522
+	secureNoroot            = 0 // From linux/securebits.h.
+)
+
+type capHeader struct {
+	version uint32
+	pid     int32
+}
+
+type capData struct {
+	effective   uint32
+	permitted   uint32
+	inheritable uint32
+}
+
+// prepareNondumpExec makes sure the process executed by the following
+// execve(2) is not dumpable from the very start, so there is no window
+// during which the processes in the container could ptrace it or access
+// its /proc/<pid> files (and thus the file descriptors it inherits from
+// the runc parent).
+//
+// Normally, execve(2) makes the process dumpable (unless it executes a
+// setuid/setgid binary, or the binary is not readable), meaning prctl(2)
+// in the new program would come too late. However, the kernel sets the
+// dumpable flag to suid_dumpable (which is never SUID_DUMP_USER) in two
+// cases (see begin_new_exec and commit_creds):
+//
+//  1. The new credentials have permitted capabilities which the old ones
+//     did not have. As stage-2 is root (in its user namespace), its
+//     permitted set after execve(2) is the bounding set. So, if we drop a
+//     capability from the permitted set (keeping it in the bounding set),
+//     execve(2) regains it, and the process becomes non-dumpable. This
+//     does not work if no_new_privs or SECURE_NOROOT are set.
+//
+//  2. The real and effective uids or gids differ at the time of execve(2).
+//     This requires a second gid mapped in the user namespace.
+//
+// The re-executed runc init restores the real gid and the dumpable flag.
+//
+//go:nosplit
+//go:norace
+func prepareNondumpExec(a *childArgs) (mode uint32, err syscall.Errno) {
+	var (
+		hdr  capHeader
+		data [2]capData
+		r1   uintptr
+		bit  uint32
+		cap  int
+	)
+	nnp, _, _ := syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0, 0)
+	secbits, _, _ := syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_GET_SECUREBITS, 0, 0, 0, 0, 0)
+	if nnp == 0 && secbits&(1<<secureNoroot) == 0 {
+		hdr.version = linuxCapabilityVersion3
+		_, _, err = syscall.RawSyscall(unix.SYS_CAPGET, uintptr(unsafe.Pointer(&hdr)), uintptr(unsafe.Pointer(&data[0])), 0)
+		if err != 0 {
+			return nondumpNone, err
+		}
+		// Find a capability in both permitted and bounding sets. Start
+		// from the highest one, to avoid touching the most commonly used
+		// ones (such as CAP_DAC_OVERRIDE) which execve(2) might need.
+		for cap = 63; cap >= 0; cap-- {
+			bit = 1 << uint(cap&31)
+			if data[cap>>5].permitted&bit == 0 {
+				continue
+			}
+			r1, _, err = syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_CAPBSET_READ, uintptr(cap), 0, 0, 0, 0)
+			if err == 0 && r1 == 1 {
+				break
+			}
+		}
+		if cap >= 0 {
+			data[cap>>5].permitted &^= bit
+			data[cap>>5].effective &^= bit
+			_, _, err = syscall.RawSyscall(unix.SYS_CAPSET, uintptr(unsafe.Pointer(&hdr)), uintptr(unsafe.Pointer(&data[0])), 0)
+			if err != 0 {
+				return nondumpNone, err
+			}
+			return nondumpCaps, 0
+		}
+	}
+	if a.nondumpGid > 0 {
+		_, _, err = syscall.RawSyscall(sysSetresgid, uintptr(a.nondumpGid), 0, 0)
+		if err == 0 {
+			return nondumpGid, 0
+		}
+	}
+	if a.nondumpRequired {
+		if err == 0 {
+			err = syscall.EPERM
+		}
+		return nondumpNone, err
+	}
+	return nondumpNone, 0
+}
+
+// childWrite sends a sync message. It is called from the forked children,
+// so it must be nosplit and must not allocate.
+//
+//go:nosplit
+//go:norace
+func childWrite(fd int, typ, a0, a1, a2 uint32) syscall.Errno {
+	msg := syncMsg{Type: typ, Arg0: a0, Arg1: a1, Arg2: a2}
+	n, _, err := syscall.RawSyscall(unix.SYS_WRITE, uintptr(fd), uintptr(unsafe.Pointer(&msg)), syncMsgSize)
+	if err == 0 && n != syncMsgSize {
+		err = syscall.EIO
+	}
+	return err
+}
+
+// childRead receives a sync message, expecting the given type.
+//
+//go:nosplit
+//go:norace
+func childRead(fd int, want uint32, pid uintptr) {
+	var msg syncMsg
+	n, _, err := syscall.RawSyscall(unix.SYS_READ, uintptr(fd), uintptr(unsafe.Pointer(&msg)), syncMsgSize)
+	if err != 0 {
+		childFail(fd, stepSyncRead, err, want, pid)
+	}
+	if n != syncMsgSize {
+		childFail(fd, stepSyncRead, syscall.EIO, want, pid)
+	}
+	if msg.Type != want {
+		childFail(fd, stepSyncUnexpected, 0, msg.Type, pid)
+	}
+}
+
+// childSend is like childWrite, but terminates the process on error.
+//
+//go:nosplit
+//go:norace
+func childSend(fd int, typ, a0 uint32, pid uintptr) {
+	if err := childWrite(fd, typ, a0, 0, 0); err != 0 {
+		childFail(fd, stepSyncWrite, err, typ, pid)
+	}
+}
+
+// childFail reports an error to stage-0, kills the given pid (if non-zero),
+// and terminates the process.
+//
+//go:nosplit
+//go:norace
+func childFail(fd int, step uint32, errno syscall.Errno, arg uint32, pid uintptr) {
+	if pid != 0 {
+		syscall.RawSyscall(unix.SYS_KILL, pid, uintptr(syscall.SIGKILL), 0)
+	}
+	_ = childWrite(fd, syncError, uint32(errno), step, arg)
+	for {
+		syscall.RawSyscall(unix.SYS_EXIT_GROUP, 1, 0, 0)
+	}
+}
+
+//go:nosplit
+//go:norace
+func childExit(code uintptr) {
+	for {
+		syscall.RawSyscall(unix.SYS_EXIT_GROUP, code, 0, 0)
+	}
+}
+
+// rawClone does clone(CLONE_PARENT|SIGCHLD) without a new stack, i.e. it
+// works like fork(2), except the child is created as a sibling.
+//
+//go:nosplit
+//go:norace
+func rawClone() (uintptr, syscall.Errno) {
+	const flags = unix.CLONE_PARENT | uintptr(syscall.SIGCHLD)
+	var (
+		pid uintptr
+		err syscall.Errno
+	)
+	if runtime.GOARCH == "s390x" {
+		// On Linux/s390, the first two arguments of clone(2) are swapped.
+		pid, _, err = syscall.RawSyscall6(unix.SYS_CLONE, 0, flags, 0, 0, 0, 0)
+	} else {
+		pid, _, err = syscall.RawSyscall6(unix.SYS_CLONE, flags, 0, 0, 0, 0, 0)
+	}
+	return pid, err
+}
+
+// tryUnshare calls unshare(2), retrying on EINVAL. Kernels prior to v4.3 may
+// return EINVAL on unshare when another process reads runc's /proc/$PID/status
+// or /proc/$PID/maps.
+//
+//go:nosplit
+//go:norace
+func tryUnshare(flags uintptr) syscall.Errno {
+	var err syscall.Errno
+	for i := 0; i < 5; i++ {
+		_, _, err = syscall.RawSyscall(unix.SYS_UNSHARE, flags, 0, 0)
+		if err != syscall.EINVAL {
+			break
+		}
+	}
+	return err
+}
+
+// spawnChildren forks stage-1 (which, in turn, forks stage-2) and returns
+// the stage-1 pid in the parent (stage-0).
+//
+// In the children, this function must not acquire any locks, because they
+// might have been locked at the time of the fork. This means no rescheduling,
+// no malloc calls, no write barriers, and no new stack segments (the runtime
+// will throw if the stack needs to grow). Only nosplit functions and raw
+// system calls can be used. For the same reason the compiler does not race
+// instrument it. The children never return from this function: stage-1 exits,
+// and stage-2 re-executes the runc binary via execveat(2).
+//
+//go:noinline
+//go:norace
+//go:nocheckptr
+func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
+	// Declare all variables at the top, so that there's no need for any
+	// allocation after beforeFork.
+	var (
+		err1    syscall.Errno
+		i       int
+		pass    int
+		toJoin  uintptr
+		joined  uintptr
+		allow   uintptr
+		done    uint64
+		allDone uint64
+		stage2  uintptr
+		sfd     int
+		mode    uint32
+	)
+
+	// About to call fork. No more allocation or calls
+	// of non-nosplit functions. This also blocks all signals.
+	beforeFork()
+	pid, errno = rawClone()
+	if errno != 0 || pid != 0 {
+		// The parent (stage-0).
+		afterFork()
+		return
+	}
+
+	// ----- Stage-1 -----
+	//
+	// Our job is to join any provided namespaces and unshare all of the
+	// requested namespaces. If we've been asked to CLONE_NEWUSER, we ask
+	// stage-0 to set up our user mappings for us. Then, we create a new
+	// child (stage-2) for PID namespace, and send its PID to stage-0.
+	sfd = a.syncChild[0]
+	syscall.RawSyscall(unix.SYS_CLOSE, uintptr(a.syncChild[1]), 0, 0)
+	syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_NAME, uintptr(unsafe.Pointer(a.stage1Name)), 0, 0, 0, 0)
+
+	// We need to setns first. We cannot do this earlier (in stage-0)
+	// because of the fact that we forked to get here (the PID of stage-2
+	// would be meaningless).
+	if len(a.nsFds) > 0 {
+		for i = 0; i < len(a.nsTypes); i++ {
+			toJoin |= a.nsTypes[i]
+			allDone |= 1 << uint(i)
+		}
+		// We first try to join all non-userns namespaces to join any
+		// namespaces that we might not be able to join once we switch
+		// credentials to the container's userns. We then join the user
+		// namespace, and then try to join any remaining namespaces (this
+		// last step is needed for rootless containers -- we don't get
+		// setns(2) permissions until we join the userns and get
+		// CAP_SYS_ADMIN). This is similar to what nsenter(1) does.
+		for pass = 0; pass < 3; pass++ {
+			if pass == 1 {
+				allow = unix.CLONE_NEWUSER
+			} else {
+				allow = toJoin &^ (joined | unix.CLONE_NEWUSER)
+			}
+			for i = 0; i < len(a.nsFds); i++ {
+				if done&(1<<uint(i)) != 0 || a.nsTypes[i]&allow == 0 {
+					continue
+				}
+				_, _, err1 = syscall.RawSyscall(unix.SYS_SETNS, uintptr(a.nsFds[i]), a.nsTypes[i], 0)
+				if err1 == syscall.EPERM {
+					// Skip permission errors (see above).
+					continue
+				}
+				if err1 != 0 {
+					childFail(sfd, stepSetns, err1, uint32(i), 0)
+				}
+				joined |= a.nsTypes[i]
+				done |= 1 << uint(i)
+
+				// If we change user namespaces, make sure we switch to
+				// root in the namespace (this matches the logic for
+				// unshare(CLONE_NEWUSER)), lots of things can break if we
+				// aren't the right user. See
+				// https://github.com/opencontainers/runc/issues/4466.
+				if a.nsTypes[i] == unix.CLONE_NEWUSER {
+					if _, _, err1 = syscall.RawSyscall(sysSetresuid, 0, 0, 0); err1 != 0 {
+						childFail(sfd, stepSetresuidUserns, err1, 0, 0)
+					}
+				}
+				syscall.RawSyscall(unix.SYS_CLOSE, uintptr(a.nsFds[i]), 0, 0)
+			}
+		}
+		// Make sure we joined all the namespaces we planned to.
+		if done != allDone {
+			childFail(sfd, stepJoinNamespaces, syscall.EPERM, uint32(done), 0)
+		}
+	}
+
+	// Deal with user namespaces first. They are quite special, as they
+	// affect our ability to unshare other namespaces and are used as
+	// context for privilege checks.
+	//
+	// We don't unshare all namespaces in one go. The reason for this is
+	// that, while the kernel documentation may claim otherwise, there are
+	// certain cases where unsharing all namespaces at once will result in
+	// namespace objects being owned incorrectly (for example, the SELinux
+	// label of the internal kern-mount that mqueue uses will be incorrect
+	// if the UTS namespace is cloned before the USER namespace is mapped).
+	if a.newUserns {
+		if err1 = tryUnshare(unix.CLONE_NEWUSER); err1 != 0 {
+			childFail(sfd, stepUnshareUserns, err1, 0, 0)
+		}
+		// We need to set ourselves as dumpable temporarily so that the
+		// parent process can write to our procfs files.
+		if a.toggleDumpable {
+			if _, _, err1 = syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_DUMPABLE, 1, 0, 0, 0, 0); err1 != 0 {
+				childFail(sfd, stepSetDumpable, err1, 1, 0)
+			}
+		}
+		// We don't have the privileges to do any mapping here, so
+		// signal stage-0 to do the mapping for us.
+		childSend(sfd, syncUsermapPls, 0, 0)
+		childRead(sfd, syncUsermapAck, 0)
+		// Revert temporary re-dumpable setting.
+		if a.toggleDumpable {
+			if _, _, err1 = syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_DUMPABLE, 0, 0, 0, 0, 0); err1 != 0 {
+				childFail(sfd, stepSetDumpable, err1, 0, 0)
+			}
+		}
+		// Become root in the namespace proper.
+		if _, _, err1 = syscall.RawSyscall(sysSetresuid, 0, 0, 0); err1 != 0 {
+			childFail(sfd, stepSetresuidUserns, err1, 0, 0)
+		}
+	}
+
+	// Unshare all of the remaining namespaces. Note that we don't merge
+	// this with clone() because there were some old kernel versions where
+	// clone(CLONE_PARENT | CLONE_NEWPID) was broken.
+	if err1 = tryUnshare(a.cloneFlags); err1 != 0 {
+		childFail(sfd, stepUnshare, err1, 0, 0)
+	}
+
+	if a.timens {
+		childSend(sfd, syncTimeOffsetsPls, 0, 0)
+		childRead(sfd, syncTimeOffsetsAck, 0)
+	}
+
+	// We fork again because of PID namespace, setns(2) or unshare(2) don't
+	// change the PID namespace of the calling process, so we must fork to
+	// actually enter the new PID namespace.
+	stage2, err1 = rawClone()
+	if err1 != 0 {
+		childFail(sfd, stepCloneStage2, err1, 0, 0)
+	}
+	if stage2 != 0 {
+		// Still stage-1. Close our copy of the stage-2 sync socket, so
+		// that stage-0 can detect when stage-2 exits or execs.
+		syscall.RawSyscall(unix.SYS_CLOSE, uintptr(a.syncGrandchild[0]), 0, 0)
+		// Send the child to our parent, which knows what it's doing.
+		childSend(sfd, syncRecvPidPls, uint32(stage2), stage2)
+		childRead(sfd, syncRecvPidAck, stage2)
+		childSend(sfd, syncChildFinish, 0, stage2)
+		// Our work is done. Stage-2 is doing the rest of the work.
+		childExit(0)
+	}
+
+	// ----- Stage-2 -----
+	//
+	// We're the final child process. Our job is to do the final setup
+	// steps and then re-execute runc init in the new namespaces.
+	syscall.RawSyscall(unix.SYS_CLOSE, uintptr(sfd), 0, 0)
+	sfd = a.syncGrandchild[0]
+	syscall.RawSyscall(unix.SYS_CLOSE, uintptr(a.syncGrandchild[1]), 0, 0)
+	syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_NAME, uintptr(unsafe.Pointer(a.stage2Name)), 0, 0, 0, 0)
+
+	childRead(sfd, syncGrandchild, 0)
+
+	if _, _, err1 = syscall.RawSyscall(unix.SYS_SETSID, 0, 0, 0); err1 != 0 {
+		childFail(sfd, stepSetsid, err1, 0, 0)
+	}
+	if _, _, err1 = syscall.RawSyscall(sysSetresuid, 0, 0, 0); err1 != 0 {
+		childFail(sfd, stepSetuid, err1, 0, 0)
+	}
+	if _, _, err1 = syscall.RawSyscall(sysSetresgid, 0, 0, 0); err1 != 0 {
+		childFail(sfd, stepSetgid, err1, 0, 0)
+	}
+	if a.setgroups {
+		if _, _, err1 = syscall.RawSyscall(sysSetgroups, 0, 0, 0); err1 != 0 {
+			childFail(sfd, stepSetgroups, err1, 0, 0)
+		}
+	}
+	// Restore the RLIMIT_NOFILE soft limit changed by the Go runtime of
+	// stage-0, so that the exec'ed runc init sees the original value.
+	if a.restoreNofile {
+		if _, _, err1 = syscall.RawSyscall6(unix.SYS_PRLIMIT64, 0, unix.RLIMIT_NOFILE, uintptr(unsafe.Pointer(&a.nofile)), 0, 0, 0); err1 != 0 {
+			childFail(sfd, stepSetrlimit, err1, 0, 0)
+		}
+	}
+
+	// This must be the last thing to do before execveat, as it might drop
+	// a capability.
+	mode, err1 = prepareNondumpExec(a)
+	if err1 != 0 {
+		childFail(sfd, stepNondumpable, err1, 0, 0)
+	}
+
+	childSend(sfd, syncChildFinish, mode, 0)
+
+	// Reset signal handlers to their defaults and restore the signal mask.
+	afterForkInChild()
+
+	// Re-execute runc init. sfd is O_CLOEXEC, so stage-0 gets EOF once
+	// execveat succeeds.
+	_, _, err1 = syscall.RawSyscall6(unix.SYS_EXECVEAT, uintptr(a.exeFd),
+		uintptr(unsafe.Pointer(a.emptyPath)),
+		uintptr(unsafe.Pointer(&a.argv[0])),
+		uintptr(unsafe.Pointer(&a.envv[0])),
+		unix.AT_EMPTY_PATH, 0)
+	childFail(sfd, stepExec, err1, 0, 0)
+	return
+}

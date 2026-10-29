@@ -67,7 +67,7 @@ GPG_KEYID ?= cyphar@cyphar.com
 
 # Some targets need cgo, which is disabled by default when cross compiling.
 # Enable cgo explicitly for those.
-# Both runc and libcontainer/integration need libcontainer/nsenter.
+# runc needs it for libseccomp and for static PIE (external linking).
 runc static localunittest: export CGO_ENABLED=1
 # seccompagent needs libseccomp (when seccomp build tag is set).
 ifneq (,$(filter $(BUILDTAGS),seccomp))

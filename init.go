@@ -10,7 +10,8 @@ import (
 func init() {
 	if len(os.Args) > 1 && os.Args[1] == "init" {
 		// This is the golang entry point for runc init, executed
-		// before main() but after libcontainer/nsenter's nsexec().
+		// before main() but after libcontainer/nsenter has set up
+		// the namespaces and re-executed runc init in them.
 		libcontainer.Init()
 	}
 }
