@@ -42,6 +42,7 @@ it goes through these stages:
   exits.
 
 * **stage-1** (raw system calls only) joins the namespaces (`setns(2)`),
+  except for an existing mount namespace (see below),
   unshares the user namespace (asking stage-0 to set up the mappings),
   unshares the remaining namespaces, and spawns stage-2 using
   `clone(CLONE_PARENT)` (we have to fork to enter the new PID namespace).
@@ -56,8 +57,30 @@ it goes through these stages:
   environment.
 
 * When the re-executed `runc init` sees `_LIBCONTAINER_NSEXEC_DONE`, the
-  init function restores the dumpable flag, the real gid, and the
-  personality, and returns to allow the Go part of `runc init` to take over.
+  init function joins the existing mount namespace (if any), restores the
+  dumpable flag, the real gid, and the personality, and returns to allow
+  the Go part of `runc init` to take over.
+
+### Joining an existing mount namespace
+
+Stage-2 must not re-execute runc while being in the container's mount
+namespace: for a dynamically linked binary, the kernel would look up the ELF
+interpreter (which would then load the shared libraries) in the container
+filesystem. Instead, stage-0 passes the mount namespace fd to the
+re-executed `runc init` (via `_LIBCONTAINER_NSEXEC_MNTNS`), which joins it
+from the package init function.
+
+A multi-threaded process can't `setns(2)` into a mount namespace, since all
+the Go runtime threads share the same `fs_struct`. So, the main thread
+(on which the main goroutine runs during the package initialization) is
+locked (and is never unlocked), unshares its `fs_struct`
+(`unshare(CLONE_FS)`), and joins the mount namespace alone. The rest of
+`runc init` runs on this thread (see `libcontainer.Init`), and when it
+`execve(2)`s the container process, the kernel kills all other threads,
+and the mount namespace of this thread is kept.
+
+Creating a new mount namespace (`unshare(CLONE_NEWNS)`) is still done by
+stage-1, as it starts as a copy of the current one.
 
 ### Dumpability across execve
 

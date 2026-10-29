@@ -52,6 +52,7 @@ const (
 	stepSetgroups
 	stepSetrlimit
 	stepNondumpable
+	stepMntnsFd
 	stepExec
 )
 
@@ -115,6 +116,10 @@ type childArgs struct {
 	// used as a real gid for execveat if the capability-based method is
 	// not available, or -1.
 	nondumpGid int
+
+	// A mount namespace fd to be inherited by the re-executed runc init
+	// (O_CLOEXEC is cleared by stage-2), or -1.
+	mntnsFd int
 
 	// execveat(2) arguments for stage-2.
 	exeFd     int
@@ -529,6 +534,13 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 	if a.restoreNofile {
 		if _, _, err1 = syscall.RawSyscall6(unix.SYS_PRLIMIT64, 0, unix.RLIMIT_NOFILE, uintptr(unsafe.Pointer(&a.nofile)), 0, 0, 0); err1 != 0 {
 			childFail(sfd, stepSetrlimit, err1, 0, 0)
+		}
+	}
+
+	// Pass the mount namespace fd to the re-executed runc init.
+	if a.mntnsFd >= 0 {
+		if _, _, err1 = syscall.RawSyscall(unix.SYS_FCNTL, uintptr(a.mntnsFd), unix.F_SETFD, 0); err1 != 0 {
+			childFail(sfd, stepMntnsFd, err1, 0, 0)
 		}
 	}
 

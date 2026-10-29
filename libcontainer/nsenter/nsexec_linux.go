@@ -1,7 +1,6 @@
 package nsenter
 
 import (
-	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -357,30 +356,6 @@ func (s *stage0) updateTimeNsOffsets(pid int) {
 	}
 }
 
-// exeInterpreter returns the ELF interpreter (PT_INTERP) of the current
-// executable, or an empty string if it is statically linked.
-func exeInterpreter() string {
-	f, err := elf.Open("/proc/self/exe")
-	if err != nil {
-		bail("failed to parse /proc/self/exe: %v", err)
-	}
-	defer f.Close()
-	for _, p := range f.Progs {
-		if p.Type != elf.PT_INTERP {
-			continue
-		}
-		buf := make([]byte, p.Filesz)
-		if _, err := p.ReadAt(buf, 0); err != nil {
-			bail("failed to read PT_INTERP of /proc/self/exe: %v", err)
-		}
-		if interp := cstr(buf); interp != "" {
-			return interp
-		}
-		return "(unknown)"
-	}
-	return ""
-}
-
 // nondumpGid returns a non-zero gid which is likely valid in the container
 // user namespace, or -1. See prepareNondumpExec.
 func (s *stage0) nondumpGid() int {
@@ -510,6 +485,8 @@ func (s *stage0) childError(stage string, msg syncMsg) string {
 	case stepNondumpable:
 		return fmt.Sprintf("unable to make sure runc init is non-dumpable after execve "+
 			"(no_new_privs or SECURE_NOROOT are set, and there's no second gid mapped): %v", errno)
+	case stepMntnsFd:
+		return fmt.Sprintf("failed to clear O_CLOEXEC on mnt namespace fd: %v", errno)
 	case stepExec:
 		return fmt.Sprintf("failed to re-execute runc init: %v", errno)
 	}
@@ -562,18 +539,22 @@ func nsexec(pipenum int) {
 		s.ns = openNamespaces(s.cfg.namespaces)
 	}
 
-	// Stage-2 re-executes the runc binary after joining the namespaces.
-	// If the binary has an ELF interpreter (i.e. it is dynamically
-	// linked), the kernel looks it up (and then the interpreter loads
-	// shared libraries) in the current mount namespace, which, once we
-	// joined an existing mount namespace, is the container's one. This is
-	// not going to work, and must never be allowed to, since the files
-	// there are controlled by the container.
-	for _, ns := range s.ns {
+	// Stage-2 re-executes the runc binary. If we joined an existing mount
+	// namespace (the container's one) before that, the kernel would look
+	// up the ELF interpreter of a dynamically linked binary (and then the
+	// interpreter would load shared libraries) in it. Not only this does
+	// not work, it must never be allowed to, since the files there are
+	// controlled by the container. So, the existing mount namespace is
+	// joined by the re-executed runc init instead (see stage2Init).
+	//
+	// Note that creating a new mount namespace (unshare(CLONE_NEWNS)) is
+	// fine, as it is a copy of the current one.
+	mntnsFd := -1
+	for i, ns := range s.ns {
 		if ns.typ == unix.CLONE_NEWNS {
-			if interp := exeInterpreter(); interp != "" {
-				bail("can't join mnt namespace: runc binary is dynamically linked (interpreter %s); a statically linked runc is required", interp)
-			}
+			mntnsFd = ns.fd
+			s.ns = append(s.ns[:i], s.ns[i+1:]...)
+			break
 		}
 	}
 
@@ -591,6 +572,7 @@ func nsexec(pipenum int) {
 		emptyPath:       cstring(""),
 		stage1Name:      cstring("runc:[1:CHILD]"),
 		stage2Name:      cstring("runc:[2:INIT]"),
+		mntnsFd:         mntnsFd,
 	}
 	for _, ns := range s.ns {
 		a.nsFds = append(a.nsFds, ns.fd)
@@ -625,6 +607,9 @@ func nsexec(pipenum int) {
 		dumpVal = "1"
 	}
 	env := append(os.Environ(), stage2Env+"="+dumpVal)
+	if mntnsFd >= 0 {
+		env = append(env, mntnsEnv+"="+strconv.Itoa(mntnsFd))
+	}
 	// If execve(2) regains a capability (see prepareNondumpExec), the
 	// kernel clears some personality flags, so pass it to be restored.
 	if pers, _, errno := unix.RawSyscall(unix.SYS_PERSONALITY, 0xffffffff, 0, 0); errno == 0 {
@@ -666,6 +651,9 @@ func nsexec(pipenum int) {
 	_ = unix.Close(a.syncChild[0])
 	for _, ns := range s.ns {
 		_ = unix.Close(ns.fd)
+	}
+	if mntnsFd >= 0 {
+		_ = unix.Close(mntnsFd)
 	}
 	_ = unix.Close(exeFd)
 

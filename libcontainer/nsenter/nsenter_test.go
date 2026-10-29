@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/opencontainers/runc/libcontainer"
 	"github.com/opencontainers/runc/libcontainer/nsenter/internal/nofile"
@@ -196,6 +197,9 @@ type stage2Report struct {
 	Egid     int    `json:"egid"`
 	Env      string `json:"env"`
 	Ppid     int    `json:"ppid"`
+	MntNs    string `json:"mntns"`
+	ThMntNs  string `json:"thread_mntns"`
+	MainTh   bool   `json:"main_thread"`
 }
 
 func init() {
@@ -225,11 +229,104 @@ func init() {
 		r.Gid, r.Egid = os.Getgid(), os.Getegid()
 		r.Env = os.Getenv(stage2Env) + os.Getenv(personalityEnv)
 		r.Ppid = os.Getppid()
+		r.MntNs, _ = os.Readlink("/proc/self/ns/mnt")
+		r.ThMntNs, _ = os.Readlink("/proc/thread-self/ns/mnt")
+		r.MainTh = unix.Gettid() == os.Getpid()
 		_ = json.NewEncoder(os.NewFile(3, "init")).Encode(r)
+		unix.Exit(0)
+	}
+	if os.Args[0] == "nsenter-sleep" {
+		time.Sleep(time.Minute)
 		unix.Exit(0)
 	}
 	if strings.HasPrefix(os.Args[0], "nsenter-") {
 		unix.Exit(0)
+	}
+}
+
+// TestNsenterJoinMntns checks that an existing mount namespace is joined
+// (by the re-executed runc init).
+func TestNsenterJoinMntns(t *testing.T) {
+	// A process holding a new mount namespace.
+	holder := &exec.Cmd{
+		Path:        os.Args[0],
+		Args:        []string{"nsenter-sleep"},
+		SysProcAttr: &unix.SysProcAttr{Unshareflags: unix.CLONE_NEWNS},
+	}
+	if err := holder.Start(); err != nil {
+		t.Skipf("can't create a mount namespace: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = holder.Process.Kill()
+		_ = holder.Wait()
+	})
+	target := fmt.Sprintf("/proc/%d/ns/mnt", holder.Process.Pid)
+	self, _ := os.Readlink("/proc/self/ns/mnt")
+	// Wait for the unshare to happen.
+	var want string
+	for range 100 {
+		want, _ = os.Readlink(target)
+		if want != "" && want != self {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if want == "" || want == self {
+		t.Fatalf("mount namespace was not created: %q", want)
+	}
+
+	parent, child := newPipe(t)
+	cmd := &exec.Cmd{
+		Path:       os.Args[0],
+		Args:       []string{"nsenter-report"},
+		ExtraFiles: []*os.File{child},
+		Env:        []string{"_LIBCONTAINER_INITPIPE=3"},
+		Stdout:     os.Stdout,
+		Stderr:     os.Stderr,
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("nsenter failed to start: %v", err)
+	}
+	child.Close()
+
+	r := nl.NewNetlinkRequest(int(libcontainer.InitMsg), 0)
+	r.AddData(&libcontainer.Int32msg{
+		Type:  libcontainer.CloneFlagsAttr,
+		Value: 0,
+	})
+	r.AddData(&libcontainer.Bytemsg{
+		Type:  libcontainer.NsPathsAttr,
+		Value: []byte("mnt:" + target),
+	})
+	if _, err := io.Copy(parent, bytes.NewReader(r.Serialize())); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("nsenter error: %v", err)
+	}
+	dec := json.NewDecoder(parent)
+	var pids struct {
+		Pid2 int `json:"stage2_pid"`
+		Pid1 int `json:"stage1_pid"`
+	}
+	if err := dec.Decode(&pids); err != nil {
+		t.Fatal(err)
+	}
+	var rep stage2Report
+	if err := dec.Decode(&rep); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = unix.Wait4(pids.Pid1, nil, 0, nil)
+	_, _ = unix.Wait4(pids.Pid2, nil, 0, nil)
+	t.Logf("report: %+v", rep)
+	if !rep.MainTh {
+		t.Errorf("not running on the main thread")
+	}
+	if rep.MntNs != want || rep.ThMntNs != want {
+		t.Errorf("mount namespace: want %q, got %q (thread: %q)", want, rep.MntNs, rep.ThMntNs)
+	}
+	if rep.Dumpable != 0 || rep.ExecDump == 1 {
+		t.Errorf("stage-2 is dumpable (after exec: %d, now: %d)", rep.ExecDump, rep.Dumpable)
 	}
 }
 
