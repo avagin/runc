@@ -22,6 +22,7 @@ func afterForkInChild()
 
 // Synchronisation values. The values are the same as in former nsexec.c.
 const (
+	syncStage1Start    = 0x3f // Tell stage-1 to proceed after parent setup.
 	syncUsermapPls     = 0x40 // Request parent to map our users.
 	syncUsermapAck     = 0x41 // Mapping finished by the parent.
 	syncRecvPidPls     = 0x42 // Tell parent we're sending the PID.
@@ -39,6 +40,7 @@ const (
 	stepSyncWrite
 	stepSyncRead
 	stepSyncUnexpected
+	stepChdir
 	stepSetns
 	stepJoinNamespaces
 	stepSetresuidUserns
@@ -50,14 +52,14 @@ const (
 	stepSetuid
 	stepSetgid
 	stepSetgroups
+	stepDup
 	stepSetrlimit
 	stepNondumpable
-	stepMntnsFd
 	stepExec
 )
 
 // How stage-2 ensures that the process is not dumpable right after execveat
-// (reported to stage-0 along with syncChildFinish).
+// (reported to the parent along with syncChildFinish).
 const (
 	nondumpNone = iota // Not needed (or not possible, if not required).
 	nondumpCaps        // A capability is regained on exec.
@@ -65,7 +67,7 @@ const (
 )
 
 // syncMsg is a fixed-size message used for all synchronisation between
-// stage-0, stage-1 and stage-2.
+// the parent, stage-1, and stage-2.
 type syncMsg struct {
 	Type uint32
 	Arg0 uint32 // pid, errno, or received sync type
@@ -80,16 +82,38 @@ type rlimit64 struct {
 	Max uint64
 }
 
+// cloneArgs holds arguments for the clone3(2) Linux syscall.
+type cloneArgs struct {
+	flags      uint64
+	pidFD      uint64
+	childTID   uint64
+	parentTID  uint64
+	exitSignal uint64
+	stack      uint64
+	stackSize  uint64
+	tls        uint64
+	setTID     uint64
+	setTIDSize uint64
+	cgroup     uint64
+}
+
 // childArgs contains everything stage-1 and stage-2 need. It is fully
-// prepared by stage-0 before the fork, because the forked children are not
+// prepared by the parent before the fork, because the forked children are not
 // allowed to allocate memory.
 type childArgs struct {
-	// syncChild[0] is used by stage-1, syncChild[1] by stage-0.
+	// Whether to use clone3(2) (for CLONE_INTO_CGROUP) when spawning stage-1.
+	useClone3 bool
+	clone3    cloneArgs
+
+	// syncChild[0] is used by stage-1, syncChild[1] by the parent.
 	syncChild [2]int
-	// syncGrandchild[0] is used by stage-2, syncGrandchild[1] by stage-0.
+	// syncGrandchild[0] is used by stage-2, syncGrandchild[1] by the parent.
 	syncGrandchild [2]int
 
-	// Namespaces to join (pre-opened by stage-0).
+	// Working directory to chdir(2) into in stage-1 before setns/unshare, or nil.
+	dir *byte
+
+	// Namespaces to join (pre-opened by the parent).
 	nsFds   []int
 	nsTypes []uintptr
 
@@ -97,10 +121,10 @@ type childArgs struct {
 	cloneFlags uintptr
 	// Whether to create a new user namespace.
 	newUserns bool
-	// Whether the process is set as non-dumpable (and so has to be set
-	// as dumpable temporarily for the parent to write uid/gid maps).
-	toggleDumpable bool
-	// Whether to ask stage-0 to write time namespace offsets.
+	// Whether the child process should be made non-dumpable (because
+	// existing namespaces are being joined).
+	nonDumpable bool
+	// Whether to ask the parent to write time namespace offsets.
 	timens bool
 
 	// Whether to call setgroups(0, NULL) in stage-2.
@@ -109,17 +133,14 @@ type childArgs struct {
 	restoreNofile bool
 	nofile        rlimit64
 
-	// Whether stage-2 must fail if it can not make sure the re-executed
-	// process is non-dumpable from the very start.
-	nondumpRequired bool
 	// A gid (other than 0) valid in the container user namespace, to be
 	// used as a real gid for execveat if the capability-based method is
 	// not available, or -1.
 	nondumpGid int
 
-	// A mount namespace fd to be inherited by the re-executed runc init
-	// (O_CLOEXEC is cleared by stage-2), or -1.
-	mntnsFd int
+	// File descriptors to be placed at 0 .. len(files)-1 in stage-2.
+	files  []int
+	nextFd int
 
 	// execveat(2) arguments for stage-2.
 	exeFd     int
@@ -170,7 +191,7 @@ type capData struct {
 //  2. The real and effective uids or gids differ at the time of execve(2).
 //     This requires a second gid mapped in the user namespace.
 //
-// The re-executed runc init restores the real gid and the dumpable flag.
+// The executed runc init restores the real gid and the dumpable flag.
 //
 //go:nosplit
 //go:norace
@@ -219,7 +240,7 @@ func prepareNondumpExec(a *childArgs) (mode uint32, err syscall.Errno) {
 			return nondumpGid, 0
 		}
 	}
-	if a.nondumpRequired {
+	if a.nonDumpable {
 		if err == 0 {
 			err = syscall.EPERM
 		}
@@ -270,7 +291,7 @@ func childSend(fd int, typ, a0 uint32, pid uintptr) {
 	}
 }
 
-// childFail reports an error to stage-0, kills the given pid (if non-zero),
+// childFail reports an error to the parent, kills the given pid (if non-zero),
 // and terminates the process.
 //
 //go:nosplit
@@ -293,13 +314,13 @@ func childExit(code uintptr) {
 	}
 }
 
-// rawClone does clone(CLONE_PARENT|SIGCHLD) without a new stack, i.e. it
-// works like fork(2), except the child is created as a sibling.
+// rawClone does clone(flags|SIGCHLD) without a new stack, i.e. it works like
+// fork(2), optionally with flags such as CLONE_PARENT.
 //
 //go:nosplit
 //go:norace
-func rawClone() (uintptr, syscall.Errno) {
-	const flags = unix.CLONE_PARENT | uintptr(syscall.SIGCHLD)
+func rawClone(flags uintptr) (uintptr, syscall.Errno) {
+	flags |= uintptr(syscall.SIGCHLD)
 	var (
 		pid uintptr
 		err syscall.Errno
@@ -331,7 +352,7 @@ func tryUnshare(flags uintptr) syscall.Errno {
 }
 
 // spawnChildren forks stage-1 (which, in turn, forks stage-2) and returns
-// the stage-1 pid in the parent (stage-0).
+// the stage-1 pid in the parent.
 //
 // In the children, this function must not acquire any locks, because they
 // might have been locked at the time of the fork. This means no rescheduling,
@@ -339,7 +360,7 @@ func tryUnshare(flags uintptr) syscall.Errno {
 // will throw if the stack needs to grow). Only nosplit functions and raw
 // system calls can be used. For the same reason the compiler does not race
 // instrument it. The children never return from this function: stage-1 exits,
-// and stage-2 re-executes the runc binary via execveat(2).
+// and stage-2 executes the runc binary via execveat(2).
 //
 //go:noinline
 //go:norace
@@ -358,15 +379,20 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 		allDone uint64
 		stage2  uintptr
 		sfd     int
+		nextfd  int
 		mode    uint32
 	)
 
 	// About to call fork. No more allocation or calls
 	// of non-nosplit functions. This also blocks all signals.
 	beforeFork()
-	pid, errno = rawClone()
+	if a.useClone3 {
+		pid, _, errno = syscall.RawSyscall(unix.SYS_CLONE3, uintptr(unsafe.Pointer(&a.clone3)), unsafe.Sizeof(a.clone3), 0)
+	} else {
+		pid, errno = rawClone(0)
+	}
 	if errno != 0 || pid != 0 {
-		// The parent (stage-0).
+		// The parent.
 		afterFork()
 		return
 	}
@@ -375,13 +401,34 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 	//
 	// Our job is to join any provided namespaces and unshare all of the
 	// requested namespaces. If we've been asked to CLONE_NEWUSER, we ask
-	// stage-0 to set up our user mappings for us. Then, we create a new
-	// child (stage-2) for PID namespace, and send its PID to stage-0.
+	// our parent to set up our user mappings for us. Then, we create a new
+	// child (stage-2) with CLONE_PARENT for PID namespace, and send its
+	// PID to our parent.
 	sfd = a.syncChild[0]
 	syscall.RawSyscall(unix.SYS_CLOSE, uintptr(a.syncChild[1]), 0, 0)
 	syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_NAME, uintptr(unsafe.Pointer(a.stage1Name)), 0, 0, 0, 0)
 
-	// We need to setns first. We cannot do this earlier (in stage-0)
+	// Wait for the parent to configure cgroups, CPU affinity, Intel RDT,
+	// and oom_score_adj on us while we are still dumpable and in the host
+	// namespaces.
+	childRead(sfd, syncStage1Start, 0)
+
+	if a.dir != nil {
+		if _, _, err1 = syscall.RawSyscall(unix.SYS_CHDIR, uintptr(unsafe.Pointer(a.dir)), 0, 0); err1 != 0 {
+			childFail(sfd, stepChdir, err1, 0, 0)
+		}
+	}
+
+	// Make the process non-dumpable before joining namespaces, to avoid
+	// race conditions that could allow processes in namespaces we're
+	// joining to access host resources.
+	if a.nonDumpable {
+		if _, _, err1 = syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_DUMPABLE, 0, 0, 0, 0, 0); err1 != 0 {
+			childFail(sfd, stepSetDumpable, err1, 0, 0)
+		}
+	}
+
+	// We need to setns first. We cannot do this earlier (in the parent)
 	// because of the fact that we forked to get here (the PID of stage-2
 	// would be meaningless).
 	if len(a.nsFds) > 0 {
@@ -452,17 +499,17 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 		}
 		// We need to set ourselves as dumpable temporarily so that the
 		// parent process can write to our procfs files.
-		if a.toggleDumpable {
+		if a.nonDumpable {
 			if _, _, err1 = syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_DUMPABLE, 1, 0, 0, 0, 0); err1 != 0 {
 				childFail(sfd, stepSetDumpable, err1, 1, 0)
 			}
 		}
 		// We don't have the privileges to do any mapping here, so
-		// signal stage-0 to do the mapping for us.
+		// signal the parent to do the mapping for us.
 		childSend(sfd, syncUsermapPls, 0, 0)
 		childRead(sfd, syncUsermapAck, 0)
 		// Revert temporary re-dumpable setting.
-		if a.toggleDumpable {
+		if a.nonDumpable {
 			if _, _, err1 = syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_DUMPABLE, 0, 0, 0, 0, 0); err1 != 0 {
 				childFail(sfd, stepSetDumpable, err1, 0, 0)
 			}
@@ -487,16 +534,17 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 
 	// We fork again because of PID namespace, setns(2) or unshare(2) don't
 	// change the PID namespace of the calling process, so we must fork to
-	// actually enter the new PID namespace.
-	stage2, err1 = rawClone()
+	// actually enter the new PID namespace. We use CLONE_PARENT so that
+	// stage-2 is a direct child of the parent process.
+	stage2, err1 = rawClone(unix.CLONE_PARENT)
 	if err1 != 0 {
 		childFail(sfd, stepCloneStage2, err1, 0, 0)
 	}
 	if stage2 != 0 {
 		// Still stage-1. Close our copy of the stage-2 sync socket, so
-		// that stage-0 can detect when stage-2 exits or execs.
+		// that the parent can detect when stage-2 exits or execs.
 		syscall.RawSyscall(unix.SYS_CLOSE, uintptr(a.syncGrandchild[0]), 0, 0)
-		// Send the child to our parent, which knows what it's doing.
+		// Send the child PID to our parent.
 		childSend(sfd, syncRecvPidPls, uint32(stage2), stage2)
 		childRead(sfd, syncRecvPidAck, stage2)
 		childSend(sfd, syncChildFinish, 0, stage2)
@@ -507,7 +555,7 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 	// ----- Stage-2 -----
 	//
 	// We're the final child process. Our job is to do the final setup
-	// steps and then re-execute runc init in the new namespaces.
+	// steps and then execute runc init in the new namespaces.
 	syscall.RawSyscall(unix.SYS_CLOSE, uintptr(sfd), 0, 0)
 	sfd = a.syncGrandchild[0]
 	syscall.RawSyscall(unix.SYS_CLOSE, uintptr(a.syncGrandchild[1]), 0, 0)
@@ -529,18 +577,62 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 			childFail(sfd, stepSetgroups, err1, 0, 0)
 		}
 	}
+
+	// Place the inherited file descriptors at 0 .. len(a.files)-1.
+	// First, move sfd and a.exeFd above len(a.files) so pass 2 won't
+	// overwrite them.
+	nextfd = a.nextFd
+	if sfd < len(a.files) {
+		if _, _, err1 = syscall.RawSyscall(unix.SYS_DUP3, uintptr(sfd), uintptr(nextfd), unix.O_CLOEXEC); err1 != 0 {
+			childFail(sfd, stepDup, err1, 0, 0)
+		}
+		sfd = nextfd
+		nextfd++
+	}
+	if a.exeFd < len(a.files) {
+		if _, _, err1 = syscall.RawSyscall(unix.SYS_DUP3, uintptr(a.exeFd), uintptr(nextfd), unix.O_CLOEXEC); err1 != 0 {
+			childFail(sfd, stepDup, err1, 0, 0)
+		}
+		a.exeFd = nextfd
+		nextfd++
+	}
+	// Pass 1: move any a.files[i] < i above nextfd so pass 2 won't
+	// overwrite an fd it needs later.
+	for i = 0; i < len(a.files); i++ {
+		if a.files[i] >= 0 && a.files[i] < i {
+			if _, _, err1 = syscall.RawSyscall(unix.SYS_DUP3, uintptr(a.files[i]), uintptr(nextfd), unix.O_CLOEXEC); err1 != 0 {
+				childFail(sfd, stepDup, err1, 0, 0)
+			}
+			a.files[i] = nextfd
+			nextfd++
+		}
+	}
+	// Pass 2: dup a.files[i] down onto i (clearing O_CLOEXEC).
+	for i = 0; i < len(a.files); i++ {
+		if a.files[i] < 0 {
+			syscall.RawSyscall(unix.SYS_CLOSE, uintptr(i), 0, 0)
+			continue
+		}
+		if a.files[i] == i {
+			if _, _, err1 = syscall.RawSyscall(unix.SYS_FCNTL, uintptr(i), unix.F_SETFD, 0); err1 != 0 {
+				childFail(sfd, stepDup, err1, 0, 0)
+			}
+			continue
+		}
+		if _, _, err1 = syscall.RawSyscall(unix.SYS_DUP3, uintptr(a.files[i]), uintptr(i), 0); err1 != 0 {
+			childFail(sfd, stepDup, err1, 0, 0)
+		}
+	}
+	// Mark any remaining fds >= len(a.files) as O_CLOEXEC.
+	if len(a.files) > 0 {
+		syscall.RawSyscall(unix.SYS_CLOSE_RANGE, uintptr(len(a.files)), ^uintptr(0), unix.CLOSE_RANGE_CLOEXEC)
+	}
+
 	// Restore the RLIMIT_NOFILE soft limit changed by the Go runtime of
-	// stage-0, so that the exec'ed runc init sees the original value.
+	// the parent, so that the exec'ed runc init sees the original value.
 	if a.restoreNofile {
 		if _, _, err1 = syscall.RawSyscall6(unix.SYS_PRLIMIT64, 0, unix.RLIMIT_NOFILE, uintptr(unsafe.Pointer(&a.nofile)), 0, 0, 0); err1 != 0 {
 			childFail(sfd, stepSetrlimit, err1, 0, 0)
-		}
-	}
-
-	// Pass the mount namespace fd to the re-executed runc init.
-	if a.mntnsFd >= 0 {
-		if _, _, err1 = syscall.RawSyscall(unix.SYS_FCNTL, uintptr(a.mntnsFd), unix.F_SETFD, 0); err1 != 0 {
-			childFail(sfd, stepMntnsFd, err1, 0, 0)
 		}
 	}
 
@@ -556,7 +648,7 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 	// Reset signal handlers to their defaults and restore the signal mask.
 	afterForkInChild()
 
-	// Re-execute runc init. sfd is O_CLOEXEC, so stage-0 gets EOF once
+	// Execute runc init. sfd is O_CLOEXEC, so the parent gets EOF once
 	// execveat succeeds.
 	_, _, err1 = syscall.RawSyscall6(unix.SYS_EXECVEAT, uintptr(a.exeFd),
 		uintptr(unsafe.Pointer(a.emptyPath)),

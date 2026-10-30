@@ -15,7 +15,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -31,6 +30,7 @@ import (
 	"github.com/opencontainers/runc/libcontainer/intelrdt"
 	"github.com/opencontainers/runc/libcontainer/internal/userns"
 	"github.com/opencontainers/runc/libcontainer/logs"
+	"github.com/opencontainers/runc/libcontainer/nsenter"
 	"github.com/opencontainers/runc/libcontainer/system"
 	"github.com/opencontainers/runc/libcontainer/utils"
 )
@@ -116,18 +116,23 @@ func (c *processComm) closeParent() {
 }
 
 type containerProcess struct {
-	cmd           *exec.Cmd
+	nsenterCfg    nsenter.Config
+	osProcess     *os.Process
+	processState  *os.ProcessState
+	childIOFiles  []io.Closer
+	parentIOPipes []io.Closer
+	goroutine     []func() error
+	goroutineErr  <-chan error
 	comm          *processComm
 	config        *initConfig
 	manager       cgroups.Manager
 	fds           []string
 	process       *Process
-	bootstrapData io.Reader
 	container     *Container
 }
 
 func (p *containerProcess) pid() int {
-	return p.cmd.Process.Pid
+	return p.osProcess.Pid
 }
 
 func (p *containerProcess) startTime() (uint64, error) {
@@ -136,7 +141,7 @@ func (p *containerProcess) startTime() (uint64, error) {
 }
 
 func (p *containerProcess) signal(sig os.Signal) error {
-	return p.cmd.Process.Signal(sig)
+	return p.osProcess.Signal(sig)
 }
 
 func (p *containerProcess) externalDescriptors() []string {
@@ -151,13 +156,155 @@ func (p *containerProcess) forwardChildLogs() chan error {
 	return logs.ForwardLogs(p.comm.logPipeParent)
 }
 
+func interfaceEqual(a, b any) bool {
+	defer func() {
+		_ = recover()
+	}()
+	return a == b
+}
+
+func closeDescriptors(closers []io.Closer) {
+	for _, fd := range closers {
+		_ = fd.Close()
+	}
+}
+
+func (p *containerProcess) childStdin() (*os.File, error) {
+	if p.process.Stdin == nil {
+		f, err := os.Open(os.DevNull)
+		if err != nil {
+			return nil, err
+		}
+		p.childIOFiles = append(p.childIOFiles, f)
+		return f, nil
+	}
+	if f, ok := p.process.Stdin.(*os.File); ok {
+		return f, nil
+	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	p.childIOFiles = append(p.childIOFiles, pr)
+	p.parentIOPipes = append(p.parentIOPipes, pw)
+	p.goroutine = append(p.goroutine, func() error {
+		_, err := io.Copy(pw, p.process.Stdin)
+		if errors.Is(err, unix.EPIPE) || errors.Is(err, os.ErrClosed) {
+			err = nil
+		}
+		if err1 := pw.Close(); err == nil {
+			err = err1
+		}
+		return err
+	})
+	return pr, nil
+}
+
+func (p *containerProcess) writerDescriptor(w io.Writer) (*os.File, error) {
+	if w == nil {
+		f, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+		if err != nil {
+			return nil, err
+		}
+		p.childIOFiles = append(p.childIOFiles, f)
+		return f, nil
+	}
+	if f, ok := w.(*os.File); ok {
+		return f, nil
+	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	p.childIOFiles = append(p.childIOFiles, pw)
+	p.parentIOPipes = append(p.parentIOPipes, pr)
+	p.goroutine = append(p.goroutine, func() error {
+		_, err := io.Copy(w, pr)
+		_ = pr.Close()
+		return err
+	})
+	return pw, nil
+}
+
+func (p *containerProcess) startProcess() error {
+	started := false
+	defer func() {
+		closeDescriptors(p.childIOFiles)
+		p.childIOFiles = nil
+		if !started {
+			closeDescriptors(p.parentIOPipes)
+			p.parentIOPipes = nil
+			p.goroutine = nil
+		}
+	}()
+
+	stdin, err := p.childStdin()
+	if err != nil {
+		return err
+	}
+	stdout, err := p.writerDescriptor(p.process.Stdout)
+	if err != nil {
+		return err
+	}
+	var stderr *os.File
+	if p.process.Stderr != nil && interfaceEqual(p.process.Stderr, p.process.Stdout) {
+		stderr = stdout
+	} else {
+		stderr, err = p.writerDescriptor(p.process.Stderr)
+		if err != nil {
+			return err
+		}
+	}
+
+	p.nsenterCfg.Stdin = stdin
+	p.nsenterCfg.Stdout = stdout
+	p.nsenterCfg.Stderr = stderr
+
+	proc, err := p.nsenterCfg.Exec()
+	if err != nil {
+		return err
+	}
+	p.osProcess = proc
+	started = true
+
+	if len(p.goroutine) > 0 {
+		goroutineErr := make(chan error, 1)
+		p.goroutineErr = goroutineErr
+
+		type goroutineStatus struct {
+			running  int
+			firstErr error
+		}
+		statusc := make(chan goroutineStatus, 1)
+		statusc <- goroutineStatus{running: len(p.goroutine)}
+		for _, fn := range p.goroutine {
+			go func(fn func() error) {
+				err := fn()
+
+				status := <-statusc
+				if status.firstErr == nil {
+					status.firstErr = err
+				}
+				status.running--
+				if status.running == 0 {
+					goroutineErr <- status.firstErr
+				} else {
+					statusc <- status
+				}
+			}(fn)
+		}
+		p.goroutine = nil
+	}
+	return nil
+}
+
 // terminate sends a SIGKILL to the forked process for the setns routine then waits to
 // avoid the process becoming a zombie.
 func (p *containerProcess) terminate() error {
-	if p.cmd.Process == nil {
+	if p.osProcess == nil {
 		return nil
 	}
-	err := p.cmd.Process.Kill()
+	err := p.osProcess.Kill()
 	if _, werr := p.wait(); err == nil {
 		err = werr
 	}
@@ -165,10 +312,31 @@ func (p *containerProcess) terminate() error {
 }
 
 func (p *containerProcess) wait() (*os.ProcessState, error) { //nolint:unparam
-	err := p.cmd.Wait()
+	if p.osProcess == nil {
+		return nil, errors.New("exec: not started")
+	}
+	if p.processState != nil {
+		return p.processState, errors.New("exec: Wait was already called")
+	}
+
+	state, err := p.osProcess.Wait()
+	if err == nil && !state.Success() {
+		err = &exec.ExitError{ProcessState: state}
+	}
+	p.processState = state
+
+	if p.goroutineErr != nil {
+		goroutineErr := <-p.goroutineErr
+		p.goroutineErr = nil
+		if err == nil {
+			err = goroutineErr
+		}
+	}
+	closeDescriptors(p.parentIOPipes)
+	p.parentIOPipes = nil
 
 	// Return actual ProcessState even on Wait error
-	return p.cmd.ProcessState, err
+	return p.processState, err
 }
 
 type setnsProcess struct {
@@ -214,7 +382,7 @@ func tryResetCPUAffinity(pid int) {
 func (p *setnsProcess) startWithCPUAffinity() error {
 	aff := p.config.CPUAffinity
 	if aff == nil || len(aff.Initial) == 0 {
-		return p.cmd.Start()
+		return p.startProcess()
 	}
 	errCh := make(chan error)
 	defer close(errCh)
@@ -228,7 +396,7 @@ func (p *setnsProcess) startWithCPUAffinity() error {
 			return
 		}
 
-		errCh <- p.cmd.Start()
+		errCh <- p.startProcess()
 		// Deliberately omit runtime.UnlockOSThread here.
 		// https://pkg.go.dev/runtime#LockOSThread says:
 		// "If the calling goroutine exits without unlocking the
@@ -354,7 +522,7 @@ fail:
 }
 
 func (p *setnsProcess) addIntoCgroup() error {
-	if p.cmd.SysProcAttr.UseCgroupFD {
+	if p.nsenterCfg.UseCgroupFD {
 		// We've used cgroupfd successfully, so the process is
 		// already in the proper cgroup, nothing to do here.
 		return nil
@@ -365,9 +533,9 @@ func (p *setnsProcess) addIntoCgroup() error {
 	return p.addIntoCgroupV1()
 }
 
-// prepareCgroupFD sets up p.cmd to use clone3 with CLONE_INTO_CGROUP
-// to join cgroup early, in p.cmd.Start. Returns an *os.File which
-// must be closed by the caller after p.Cmd.Start return.
+// prepareCgroupFD sets up p.nsenterCfg to use clone3 with CLONE_INTO_CGROUP
+// to join cgroup early, in p.startProcess. Returns an *os.File which
+// must be closed by the caller after p.startProcess returns.
 func (p *setnsProcess) prepareCgroupFD() (*os.File, error) {
 	const openFlags = unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC
 
@@ -412,11 +580,8 @@ func (p *setnsProcess) prepareCgroupFD() (*os.File, error) {
 
 success:
 	logrus.Debugf("using CLONE_INTO_CGROUP %q", cgroup)
-	if p.cmd.SysProcAttr == nil {
-		p.cmd.SysProcAttr = &syscall.SysProcAttr{}
-	}
-	p.cmd.SysProcAttr.UseCgroupFD = true
-	p.cmd.SysProcAttr.CgroupFD = int(fd.Fd())
+	p.nsenterCfg.UseCgroupFD = true
+	p.nsenterCfg.CgroupFD = int(fd.Fd())
 
 	return fd, nil
 
@@ -442,18 +607,7 @@ func (p *setnsProcess) startWithCgroupFD() error {
 		defer fd.Close()
 	}
 
-	cmdCopy := cloneCmd(p.cmd)
-	err = p.startWithCPUAffinity()
-	if err != nil && p.cmd.SysProcAttr.UseCgroupFD {
-		logrus.Debugf("exec with CLONE_INTO_CGROUP failed: %v; retrying without", err)
-		// SysProcAttr.CgroupFD is never used when UseCgroupFD is unset.
-		cmdCopy.SysProcAttr.UseCgroupFD = false
-		// Must not reuse exec.Cmd.
-		p.cmd = cmdCopy
-		err = p.startWithCPUAffinity()
-	}
-
-	return err
+	return p.startWithCPUAffinity()
 }
 
 func (p *setnsProcess) start() (retErr error) {
@@ -465,6 +619,7 @@ func (p *setnsProcess) start() (retErr error) {
 	if err := p.startWithCgroupFD(); err != nil {
 		return fmt.Errorf("error starting setns process: %w", err)
 	}
+	p.process.ops = p
 
 	defer func() {
 		if retErr != nil {
@@ -479,14 +634,6 @@ func (p *setnsProcess) start() (retErr error) {
 		}
 	}()
 
-	if p.bootstrapData != nil {
-		if _, err := io.Copy(p.comm.initSockParent, p.bootstrapData); err != nil {
-			return fmt.Errorf("error copying bootstrap data to pipe: %w", err)
-		}
-	}
-	if err := p.execSetns(); err != nil {
-		return fmt.Errorf("error executing setns process: %w", err)
-	}
 	if err := p.addIntoCgroup(); err != nil {
 		return err
 	}
@@ -557,7 +704,7 @@ func (p *setnsProcess) start() (retErr error) {
 			containerProcessState := &specs.ContainerProcessState{
 				Version:  specs.Version,
 				Fds:      []string{specs.SeccompFdName},
-				Pid:      p.cmd.Process.Pid,
+				Pid:      p.pid(),
 				Metadata: p.config.Config.Seccomp.ListenerMetadata,
 				State: specs.State{
 					Version:     specs.Version,
@@ -592,83 +739,9 @@ func (p *setnsProcess) start() (retErr error) {
 	return nil
 }
 
-// execSetns runs the process that executes C code to perform the setns calls
-// because setns support requires the C process to fork off a child and perform the setns
-// before the go runtime boots, we wait on the process to die and receive the child's pid
-// over the provided pipe.
-func (p *setnsProcess) execSetns() error {
-	status, err := p.cmd.Process.Wait()
-	if err != nil {
-		_ = p.cmd.Wait()
-		return fmt.Errorf("error waiting on setns process to finish: %w", err)
-	}
-	if !status.Success() {
-		_ = p.cmd.Wait()
-		return &exec.ExitError{ProcessState: status}
-	}
-	var pid *pid
-	if err := json.NewDecoder(p.comm.initSockParent).Decode(&pid); err != nil {
-		_ = p.cmd.Wait()
-		return fmt.Errorf("error reading pid from init pipe: %w", err)
-	}
-
-	// Clean up the zombie parent process
-	// On Unix systems FindProcess always succeeds.
-	firstChildProcess, _ := os.FindProcess(pid.PidFirstChild)
-
-	// Ignore the error in case the child has already been reaped for any reason
-	_, _ = firstChildProcess.Wait()
-
-	process, err := os.FindProcess(pid.Pid)
-	if err != nil {
-		return err
-	}
-	p.cmd.Process = process
-	p.process.ops = p
-	return nil
-}
-
 type initProcess struct {
 	containerProcess
 	intelRdtManager *intelrdt.Manager
-}
-
-// getChildPid receives the final child's pid over the provided pipe.
-func (p *initProcess) getChildPid() (int, error) {
-	var pid pid
-	if err := json.NewDecoder(p.comm.initSockParent).Decode(&pid); err != nil {
-		_ = p.cmd.Wait()
-		return -1, err
-	}
-
-	// Clean up the zombie parent process
-	// On Unix systems FindProcess always succeeds.
-	firstChildProcess, _ := os.FindProcess(pid.PidFirstChild)
-
-	// Ignore the error in case the child has already been reaped for any reason
-	_, _ = firstChildProcess.Wait()
-
-	return pid.Pid, nil
-}
-
-func (p *initProcess) waitForChildExit(childPid int) error {
-	status, err := p.cmd.Process.Wait()
-	if err != nil {
-		_ = p.cmd.Wait()
-		return err
-	}
-	if !status.Success() {
-		_ = p.cmd.Wait()
-		return &exec.ExitError{ProcessState: status}
-	}
-
-	process, err := os.FindProcess(childPid)
-	if err != nil {
-		return err
-	}
-	p.cmd.Process = process
-	p.process.ops = p
-	return nil
 }
 
 type mountSourceRequestFn func(*configs.Mount) (*mountSource, error)
@@ -777,34 +850,59 @@ func (p *initProcess) goCreateMountSources(ctx context.Context) (mountSourceRequ
 
 func (p *initProcess) start() (retErr error) {
 	defer p.comm.closeParent()
-	err := p.cmd.Start()
-	p.process.ops = p
-	// close the child-side of the pipes (controlled by child)
-	p.comm.closeChild()
-	if err != nil {
-		p.process.ops = nil
-		return fmt.Errorf("unable to start init: %w", err)
+
+	cgroupApplied := false
+	p.nsenterCfg.PrepareStage1 = func(stage1Pid int) error {
+		// Do this before syncing with child so that no children can escape the
+		// cgroup. We don't need to worry about not doing this and not being root
+		// because we'd be using the rootless cgroup manager in that case.
+		if err := p.manager.Apply(stage1Pid); err != nil {
+			if errors.Is(err, cgroups.ErrRootless) {
+				// ErrRootless is to be ignored except when
+				// the container doesn't have private pidns.
+				if !p.config.Config.Namespaces.IsPrivate(configs.NEWPID) {
+					// TODO: make this an error in runc 1.3.
+					logrus.Warn("Creating a rootless container with no cgroup and no private pid namespace. " +
+						"Such configuration is strongly discouraged (as it is impossible to properly kill all container's processes) " +
+						"and will result in an error in a future runc version.")
+				}
+			} else {
+				return fmt.Errorf("unable to apply cgroup configuration: %w", err)
+			}
+		}
+		cgroupApplied = true
+		// Reset the CPU affinity after cgroups are configured to make sure it
+		// matches any configured cpuset.
+		tryResetCPUAffinity(stage1Pid)
+		if p.intelRdtManager != nil {
+			if err := p.intelRdtManager.Apply(stage1Pid); err != nil {
+				return fmt.Errorf("unable to apply Intel RDT configuration: %w", err)
+			}
+		}
+		return nil
 	}
 
 	defer func() {
 		if retErr != nil {
-			// Find out if init is killed by the kernel's OOM killer.
-			// Get the count before killing init as otherwise cgroup
-			// might be removed by systemd.
-			oom, err := p.manager.OOMKillCount()
-			if err != nil {
-				logrus.WithError(err).Warn("unable to get oom kill count")
-			} else if oom > 0 {
-				// Does not matter what the particular error was,
-				// its cause is most probably OOM, so report that.
-				const oomError = "container init was OOM-killed (memory limit too low?)"
+			if cgroupApplied {
+				// Find out if init is killed by the kernel's OOM killer.
+				// Get the count before killing init as otherwise cgroup
+				// might be removed by systemd.
+				oom, err := p.manager.OOMKillCount()
+				if err != nil {
+					logrus.WithError(err).Warn("unable to get oom kill count")
+				} else if oom > 0 {
+					// Does not matter what the particular error was,
+					// its cause is most probably OOM, so report that.
+					const oomError = "container init was OOM-killed (memory limit too low?)"
 
-				if logrus.GetLevel() >= logrus.DebugLevel {
-					// Only show the original error if debug is set,
-					// as it is not generally very useful.
-					retErr = fmt.Errorf(oomError+": %w", retErr)
-				} else {
-					retErr = errors.New(oomError)
+					if logrus.GetLevel() >= logrus.DebugLevel {
+						// Only show the original error if debug is set,
+						// as it is not generally very useful.
+						retErr = fmt.Errorf(oomError+": %w", retErr)
+					} else {
+						retErr = errors.New(oomError)
+					}
 				}
 			}
 
@@ -820,53 +918,22 @@ func (p *initProcess) start() (retErr error) {
 		}
 	}()
 
-	// Do this before syncing with child so that no children can escape the
-	// cgroup. We don't need to worry about not doing this and not being root
-	// because we'd be using the rootless cgroup manager in that case.
-	if err := p.manager.Apply(p.pid()); err != nil {
-		if errors.Is(err, cgroups.ErrRootless) {
-			// ErrRootless is to be ignored except when
-			// the container doesn't have private pidns.
-			if !p.config.Config.Namespaces.IsPrivate(configs.NEWPID) {
-				// TODO: make this an error in runc 1.3.
-				logrus.Warn("Creating a rootless container with no cgroup and no private pid namespace. " +
-					"Such configuration is strongly discouraged (as it is impossible to properly kill all container's processes) " +
-					"and will result in an error in a future runc version.")
-			}
-		} else {
-			return fmt.Errorf("unable to apply cgroup configuration: %w", err)
-		}
-	}
-	// Reset the CPU affinity after cgroups are configured to make sure it
-	// matches any configured cpuset.
-	tryResetCPUAffinity(p.pid())
-	if p.intelRdtManager != nil {
-		if err := p.intelRdtManager.Apply(p.pid()); err != nil {
-			return fmt.Errorf("unable to apply Intel RDT configuration: %w", err)
-		}
-	}
-	if _, err := io.Copy(p.comm.initSockParent, p.bootstrapData); err != nil {
-		return fmt.Errorf("can't copy bootstrap data to pipe: %w", err)
-	}
-
-	childPid, err := p.getChildPid()
+	err := p.startProcess()
+	// close the child-side of the pipes (controlled by child)
+	p.comm.closeChild()
 	if err != nil {
-		return fmt.Errorf("can't get final child's PID from pipe: %w", err)
+		return fmt.Errorf("unable to start init: %w", err)
 	}
+	p.process.ops = p
 
 	// Save the standard descriptor names before the container process
 	// can potentially move them (e.g., via dup2()).  If we don't do this now,
 	// we won't know at checkpoint time which file descriptor to look up.
-	fds, err := getPipeFds(childPid)
+	fds, err := getPipeFds(p.pid())
 	if err != nil {
-		return fmt.Errorf("error getting pipe fds for pid %d: %w", childPid, err)
+		return fmt.Errorf("error getting pipe fds for pid %d: %w", p.pid(), err)
 	}
 	p.setExternalDescriptors(fds)
-
-	// Wait for our first child to exit
-	if err := p.waitForChildExit(childPid); err != nil {
-		return fmt.Errorf("error waiting for our first child to exit: %w", err)
-	}
 
 	// Spin up a goroutine to handle remapping mount requests by runc init.
 	// There is no point doing this for rootless containers because they cannot
@@ -967,7 +1034,7 @@ func (p *initProcess) start() (retErr error) {
 			}
 
 			// initProcessStartTime hasn't been set yet.
-			s.Pid = p.cmd.Process.Pid
+			s.Pid = p.pid()
 			s.Status = specs.StateCreating
 			containerProcessState := &specs.ContainerProcessState{
 				Version:  specs.Version,
@@ -1029,7 +1096,7 @@ func (p *initProcess) start() (retErr error) {
 					return err
 				}
 				// initProcessStartTime hasn't been set yet.
-				s.Pid = p.cmd.Process.Pid
+				s.Pid = p.pid()
 				s.Status = specs.StateCreating
 				hooks := p.config.Config.Hooks
 

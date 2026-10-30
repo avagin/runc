@@ -27,48 +27,49 @@ the same way `syscall.forkAndExecInChild` does. The runtime hooks used for
 that are `syscall.runtime_BeforeFork`, `syscall.runtime_AfterFork`, and
 `syscall.runtime_AfterForkInChild`.
 
-The init function first gets the file descriptor number for the init pipe
-from the environment variable `_LIBCONTAINER_INITPIPE` (which was opened by
-the parent and kept open across the fork-exec of the `runc init` process).
-If it is not set, this is not `runc init`, and nothing is done. Otherwise,
-it goes through these stages:
+The parent `runc` process invokes `nsenter.Config.Exec()` directly to spawn the
+`runc init` process inside the container namespaces:
 
-* **stage-0** (normal Go code) reads the bootstrap data (namespace paths,
-  clone flags, uid and gid mappings, etc.) from the init pipe, sets
-  `oom_score_adj`, makes the process non-dumpable, opens the namespace
-  files, and spawns stage-1 using `clone(CLONE_PARENT)`. It then serves
-  the requests from stage-1 (writing the uid/gid maps and time namespace
-  offsets), sends the PIDs of stage-1 and stage-2 to the runc parent, and
-  exits.
+* **parent (`nsenter.Config.Exec`)** (normal Go code) opens the namespace
+  files, spawns stage-1 using `clone(2)` (or `clone3(CLONE_INTO_CGROUP)`),
+  sets stage-1's `oom_score_adj`, invokes `PrepareStage1` (so cgroups, CPU
+  affinity, and Intel RDT can be configured while stage-1 is still in the
+  host namespaces), serves the requests from stage-1 (writing the uid/gid maps
+  and time namespace offsets), reaps stage-1, and returns the `*os.Process`
+  for stage-2.
 
-* **stage-1** (raw system calls only) joins the namespaces (`setns(2)`),
-  except for an existing mount namespace (see below),
-  unshares the user namespace (asking stage-0 to set up the mappings),
-  unshares the remaining namespaces, and spawns stage-2 using
-  `clone(CLONE_PARENT)` (we have to fork to enter the new PID namespace).
-  It then sends the stage-2 PID to stage-0 and exits.
+* **stage-1** (raw system calls only) waits for the parent to finish
+  `PrepareStage1`, `chdir(2)`s to the container rootfs, makes the process
+  non-dumpable, joins the namespaces (`setns(2)`), except for an existing
+  mount namespace (see below), unshares the user namespace (asking the parent
+  to set up the mappings), unshares the remaining namespaces, and spawns
+  stage-2 using `clone(CLONE_PARENT)` (we have to fork to enter the new PID
+  namespace, and `CLONE_PARENT` makes stage-2 a direct child of the parent
+  `runc`). It then sends the stage-2 PID to the parent and exits.
 
-* **stage-2** (raw system calls only) waits for stage-0, calls `setsid(2)`,
-  becomes root, restores the original `RLIMIT_NOFILE` soft limit (changed by
-  the Go runtime of stage-0, see `internal/nofile`), makes sure the process
-  is not dumpable after `execve(2)` (see below), and re-executes the runc
-  binary (`execveat(2)` on an `O_PATH` descriptor of `/proc/self/exe`,
-  opened by stage-0) with `_LIBCONTAINER_NSEXEC_DONE` set in the
-  environment.
+* **stage-2** (raw system calls only) waits for the parent, calls `setsid(2)`,
+  becomes root, sets up the inherited file descriptors (`0..N-1`) and marks
+  all higher file descriptors `O_CLOEXEC` via `close_range(CLOSE_RANGE_CLOEXEC)`,
+  restores the original `RLIMIT_NOFILE` soft limit (changed by the Go runtime
+  of the parent, see `internal/nofile`), makes sure the process is not dumpable
+  after `execve(2)` (see below), and executes `runc init` (`execveat(2)` on an
+  `O_PATH` descriptor of the cloned `/proc/self/exe` binary) with
+  `_LIBCONTAINER_NSEXEC_DONE` set in the environment.
 
-* When the re-executed `runc init` sees `_LIBCONTAINER_NSEXEC_DONE`, the
-  init function joins the existing mount namespace (if any), restores the
-  dumpable flag, the real gid, and the personality, and returns to allow
-  the Go part of `runc init` to take over.
+* When the executed `runc init` sees `_LIBCONTAINER_NSEXEC_DONE`, the
+  `nsenter` package init function joins the existing mount namespace (if any),
+  restores the dumpable flag, the real gid, the personality, and the parent
+  death signal (`PR_SET_PDEATHSIG`), and returns to allow the Go part of
+  `runc init` to take over.
 
 ### Joining an existing mount namespace
 
-Stage-2 must not re-execute runc while being in the container's mount
+Stage-2 must not execute `runc init` while being in the container's mount
 namespace: for a dynamically linked binary, the kernel would look up the ELF
 interpreter (which would then load the shared libraries) in the container
-filesystem. Instead, stage-0 passes the mount namespace fd to the
-re-executed `runc init` (via `_LIBCONTAINER_NSEXEC_MNTNS`), which joins it
-from the package init function.
+filesystem. Instead, the parent passes the mount namespace fd to `runc init`
+(via `_LIBCONTAINER_NSEXEC_MNTNS`), which joins it from the package init
+function.
 
 A multi-threaded process can't `setns(2)` into a mount namespace, since all
 the Go runtime threads share the same `fs_struct`. So, the main thread

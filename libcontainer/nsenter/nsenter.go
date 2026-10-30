@@ -2,12 +2,15 @@
 
 // Package nsenter implements the namespace creation and joining logic of runc.
 //
-// Importing this package registers an init function which, if the process is
-// a "runc init" (i.e. _LIBCONTAINER_INITPIPE is set), sets up the container
-// namespaces and re-executes the binary in them. See README.md for details.
+// Config.Exec spawns a child process ("runc init") inside the configured
+// container namespaces. Importing this package also registers an init function
+// which runs in the newly executed "runc init" to finish the namespace setup.
+// See README.md for details.
 package nsenter
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"runtime"
 	"strconv"
@@ -15,42 +18,38 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// personalityEnv is set by stage-0 to its personality(2), to be restored
-// by the re-executed runc init.
-const personalityEnv = "_LIBCONTAINER_NSEXEC_PERSONALITY"
+const (
+	// stage2Env is set for the executed runc init (stage-2), so that
+	// the package init function knows it is running inside stage-2. Its
+	// value is "1" if the process has to be kept non-dumpable, and "0"
+	// otherwise.
+	stage2Env = "_LIBCONTAINER_NSEXEC_DONE"
 
-// mntnsEnv is set by stage-0 to the number of a file descriptor of the
-// (existing) mount namespace to be joined by the re-executed runc init.
-const mntnsEnv = "_LIBCONTAINER_NSEXEC_MNTNS"
+	// personalityEnv is set to the parent's personality(2), to be restored
+	// by stage-2.
+	personalityEnv = "_LIBCONTAINER_NSEXEC_PERSONALITY"
 
-// execDumpable is the value of the dumpable flag of the re-executed runc
-// init right after execve(2). Used by tests.
+	// pdeathsigEnv is set to the parent death signal, to be set by stage-2.
+	pdeathsigEnv = "_LIBCONTAINER_NSEXEC_PDEATHSIG"
+
+	// mntnsEnv is set to the file descriptor number of the (existing)
+	// mount namespace to be joined by stage-2.
+	mntnsEnv = "_LIBCONTAINER_NSEXEC_MNTNS"
+)
+
+// execDumpable is the value of the dumpable flag of the executed runc init
+// right after execveat(2). Used by tests.
 var execDumpable = -1
 
 func init() {
-	setupLog()
-
-	// Get the init pipe fd from the environment. The init pipe is used to
-	// read the bootstrap data and tell the parent what the new pids are
-	// after the setup is done.
-	pipenum := envInt("_LIBCONTAINER_INITPIPE")
-	if pipenum < 0 {
-		// We are not a runc init. Just return to go runtime.
-		return
-	}
-
 	if v, ok := os.LookupEnv(stage2Env); ok {
-		// We are stage-2, re-executed by stage-0. Namespaces are set up.
 		stage2Init(v)
-		return
 	}
-
-	// Stage-0. This never returns.
-	nsexec(pipenum)
 }
 
 // stage2Init restores the process state altered in order to make sure that
-// the process is not dumpable after execve(2) (see prepareNondumpExec).
+// the process is not dumpable after execveat(2) (see prepareNondumpExec),
+// and joins the existing mount namespace if any.
 func stage2Init(dumpable string) {
 	execDumpable, _ = unix.PrctlRetInt(unix.PR_GET_DUMPABLE, 0, 0, 0, 0)
 	_ = os.Unsetenv(stage2Env)
@@ -88,10 +87,22 @@ func stage2Init(dumpable string) {
 			}
 		}
 	}
+
+	// Set the parent death signal (after Setresgid, which clears it).
+	if str, ok := os.LookupEnv(pdeathsigEnv); ok {
+		_ = os.Unsetenv(pdeathsigEnv)
+		sig, err := strconv.Atoi(str)
+		if err != nil || sig <= 0 {
+			bail("unable to parse %s=%s", pdeathsigEnv, str)
+		}
+		if err := unix.Prctl(unix.PR_SET_PDEATHSIG, uintptr(sig), 0, 0, 0); err != nil {
+			bail("failed to set pdeath signal %d: %v", sig, err)
+		}
+	}
 }
 
 // joinMntns joins the container's (existing) mount namespace, if needed. See
-// the comment about mntnsFd in nsexec.
+// the comment about mntnsFd in Config.Exec.
 //
 // A multi-threaded process can not join a mount namespace (setns fails with
 // EINVAL, since all the Go runtime threads share fs_struct). Instead, the
@@ -125,4 +136,24 @@ func joinMntns() {
 		bail("failed to setns into mnt namespace: %v", err)
 	}
 	_ = unix.Close(fd)
+}
+
+// bail logs a fatal message to _LIBCONTAINER_LOGPIPE (or stderr, if not set)
+// and terminates the stage-2 process.
+func bail(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if s := os.Getenv("_LIBCONTAINER_LOGPIPE"); s != "" {
+		if fd, err := strconv.Atoi(s); err == nil && fd >= 0 {
+			data, err := json.Marshal(struct {
+				Level string `json:"level"`
+				Msg   string `json:"msg"`
+			}{"fatal", msg})
+			if err == nil {
+				_ = writeAll(fd, append(data, '\n'))
+				unix.Exit(1)
+			}
+		}
+	}
+	fmt.Fprintf(os.Stderr, "FATAL: %s\n", msg)
+	unix.Exit(1)
 }

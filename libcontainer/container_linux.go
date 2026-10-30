@@ -16,13 +16,13 @@ import (
 
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
-	"github.com/vishvananda/netlink/nl"
 	"golang.org/x/sys/unix"
 
 	"github.com/opencontainers/cgroups"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/exeseal"
 	"github.com/opencontainers/runc/libcontainer/intelrdt"
+	"github.com/opencontainers/runc/libcontainer/nsenter"
 	"github.com/opencontainers/runc/libcontainer/system"
 	"github.com/opencontainers/runc/libcontainer/utils"
 )
@@ -512,9 +512,9 @@ func (c *Container) deleteExecFifo() {
 
 // includeExecFifo opens the container's execfifo as a pathfd, so that the
 // container cannot access the statedir (and the FIFO itself remains
-// un-opened). It then adds the FifoFd to the given exec.Cmd as an inherited
-// fd, with _LIBCONTAINER_FIFOFD set to its fd number.
-func (c *Container) includeExecFifo(cmd *exec.Cmd) error {
+// un-opened). It then adds the FifoFd to the given nsenter.Config as an
+// inherited fd, with _LIBCONTAINER_FIFOFD set to its fd number.
+func (c *Container) includeExecFifo(cfg *nsenter.Config) error {
 	fifoName := filepath.Join(c.stateDir, execFifoFilename)
 	fifo, err := os.OpenFile(fifoName, unix.O_PATH|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -522,9 +522,9 @@ func (c *Container) includeExecFifo(cmd *exec.Cmd) error {
 	}
 	c.fifo = fifo
 
-	cmd.ExtraFiles = append(cmd.ExtraFiles, fifo)
-	cmd.Env = append(cmd.Env,
-		"_LIBCONTAINER_FIFOFD="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1))
+	cfg.ExtraFiles = append(cfg.ExtraFiles, fifo)
+	cfg.Env = append(cfg.Env,
+		"_LIBCONTAINER_FIFOFD="+strconv.Itoa(stdioFdCount+len(cfg.ExtraFiles)-1))
 	return nil
 }
 
@@ -540,99 +540,44 @@ func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 	// only ever be called once, but libcontainer users might call this more than
 	// once.
 	p.closeClonedExes()
-	var (
-		exePath string
-		safeExe *os.File
-	)
+	var safeExe *os.File
 	if exeseal.IsSelfExeCloned() {
 		// /proc/self/exe is already a cloned binary -- no need to do anything
 		logrus.Debug("skipping binary cloning -- /proc/self/exe is already cloned!")
-		// We don't need to use /proc/thread-self here because the exe mm of a
-		// thread-group is guaranteed to be the same for all threads by
-		// definition. This lets us avoid having to do runtime.LockOSThread.
-		exePath = "/proc/self/exe"
 	} else {
 		var err error
 		safeExe, err = exeseal.CloneSelfExe(c.stateDir)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create safe /proc/self/exe clone for runc init: %w", err)
 		}
-		exePath = "/proc/self/fd/" + strconv.Itoa(int(safeExe.Fd()))
 		p.clonedExes = append(p.clonedExes, safeExe)
 		logrus.Debug("runc exeseal: using /proc/self/exe clone") // used for tests
 	}
 
-	cmd := exec.Command(exePath, "init")
-	// Theoretically, exec.Command can set cmd.Err. Practically, this
-	// should never happen (Linux, Go <= 1.26, exePath is absolute),
-	// but in the unlikely case it just did, let's fail early.
-	if cmd.Err != nil {
-		return nil, fmt.Errorf("exec.Command: %w", cmd.Err)
+	var cfg nsenter.Config
+	cfg.Exe = safeExe
+	cfg.Args = []string{os.Args[0], "init"}
+	cfg.Dir = c.config.Rootfs
+	cfg.Env = append(os.Environ(), "GOMAXPROCS="+os.Getenv("GOMAXPROCS"))
+	cfg.ExtraFiles = append(cfg.ExtraFiles, p.ExtraFiles...)
+
+	addExtraFile := func(f *os.File, envName string) {
+		cfg.ExtraFiles = append(cfg.ExtraFiles, f)
+		cfg.Env = append(cfg.Env,
+			envName+"="+strconv.Itoa(stdioFdCount+len(cfg.ExtraFiles)-1),
+		)
 	}
-	cmd.Args[0] = os.Args[0]
-	cmd.Stdin = p.Stdin
-	cmd.Stdout = p.Stdout
-	cmd.Stderr = p.Stderr
-	cmd.Dir = c.config.Rootfs
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &unix.SysProcAttr{}
-	}
-	cmd.Env = append(cmd.Env, "GOMAXPROCS="+os.Getenv("GOMAXPROCS"))
-	cmd.ExtraFiles = append(cmd.ExtraFiles, p.ExtraFiles...)
 	if p.ConsoleSocket != nil {
-		cmd.ExtraFiles = append(cmd.ExtraFiles, p.ConsoleSocket)
-		cmd.Env = append(cmd.Env,
-			"_LIBCONTAINER_CONSOLE="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1),
-		)
+		addExtraFile(p.ConsoleSocket, "_LIBCONTAINER_CONSOLE")
 	}
-
-	cmd.ExtraFiles = append(cmd.ExtraFiles, comm.initSockChild)
-	cmd.Env = append(cmd.Env,
-		"_LIBCONTAINER_INITPIPE="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1),
-	)
-	cmd.ExtraFiles = append(cmd.ExtraFiles, comm.syncSockChild.File())
-	cmd.Env = append(cmd.Env,
-		"_LIBCONTAINER_SYNCPIPE="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1),
-	)
-
-	cmd.ExtraFiles = append(cmd.ExtraFiles, comm.logPipeChild)
-	cmd.Env = append(cmd.Env,
-		"_LIBCONTAINER_LOGPIPE="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1))
+	addExtraFile(comm.initSockChild, "_LIBCONTAINER_INITPIPE")
+	addExtraFile(comm.syncSockChild.File(), "_LIBCONTAINER_SYNCPIPE")
+	addExtraFile(comm.logPipeChild, "_LIBCONTAINER_LOGPIPE")
 	if p.LogLevel != "" {
-		cmd.Env = append(cmd.Env, "_LIBCONTAINER_LOGLEVEL="+p.LogLevel)
+		cfg.Env = append(cfg.Env, "_LIBCONTAINER_LOGLEVEL="+p.LogLevel)
 	}
-
 	if p.PidfdSocket != nil {
-		cmd.ExtraFiles = append(cmd.ExtraFiles, p.PidfdSocket)
-		cmd.Env = append(cmd.Env,
-			"_LIBCONTAINER_PIDFD_SOCK="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1),
-		)
-	}
-
-	// TODO: After https://go-review.googlesource.com/c/go/+/515799 included
-	// in go versions supported by us, we can remove this logic.
-	if safeExe != nil {
-		// Due to a Go stdlib bug, we need to add safeExe to the set of
-		// ExtraFiles otherwise it is possible for the stdlib to clobber the fd
-		// during forkAndExecInChild1 and replace it with some other file that
-		// might be malicious. This is less than ideal (because the descriptor
-		// will be non-O_CLOEXEC) however we have protections in "runc init" to
-		// stop us from leaking extra file descriptors.
-		//
-		// See <https://github.com/golang/go/issues/61751>.
-		cmd.ExtraFiles = append(cmd.ExtraFiles, safeExe)
-
-		// There is a race situation when we are opening a file, if there is a
-		// small fd was closed at that time, maybe it will be reused by safeExe.
-		// Because of Go stdlib fds shuffling bug, if the fd of safeExe is too
-		// small, go stdlib will dup3 it to another fd, or dup3 a other fd to this
-		// fd, then it will cause the fd type cmd.Path refers to a random path,
-		// and it can lead to an error "permission denied" when starting the process.
-		// Please see #4294.
-		// So we should not use the original fd of safeExe, but use the fd after
-		// shuffled by Go stdlib. Because Go stdlib will guarantee this fd refers to
-		// the correct file.
-		cmd.Path = "/proc/self/fd/" + strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1)
+		addExtraFile(p.PidfdSocket, "_LIBCONTAINER_PIDFD_SOCK")
 	}
 
 	// NOTE: when running a container with no PID namespace and the parent
@@ -640,7 +585,7 @@ func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 	//       delivered to the container's init process by the kernel for some
 	//       reason even with the parent still running.
 	if c.config.ParentDeathSignal > 0 {
-		cmd.SysProcAttr.Pdeathsig = unix.Signal(c.config.ParentDeathSignal)
+		cfg.Pdeathsig = unix.Signal(c.config.ParentDeathSignal)
 	}
 
 	if p.Init {
@@ -649,36 +594,34 @@ func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 		// for container rootfs escape (and not doing it in `runc exec` avoided
 		// that problem), but we no longer do that. However, there's no need to do
 		// this for `runc exec` so we just keep it this way to be safe.
-		if err := c.includeExecFifo(cmd); err != nil {
+		if err := c.includeExecFifo(&cfg); err != nil {
 			return nil, fmt.Errorf("unable to setup exec fifo: %w", err)
 		}
-		return c.newInitProcess(p, cmd, comm)
+		return c.newInitProcess(p, &cfg, comm)
 	}
-	return c.newSetnsProcess(p, cmd, comm)
+	return c.newSetnsProcess(p, &cfg, comm)
 }
 
-func (c *Container) newInitProcess(p *Process, cmd *exec.Cmd, comm *processComm) (*initProcess, error) {
-	cmd.Env = append(cmd.Env, "_LIBCONTAINER_INITTYPE="+string(initStandard))
+func (c *Container) newInitProcess(p *Process, cfg *nsenter.Config, comm *processComm) (*initProcess, error) {
+	cfg.Env = append(cfg.Env, "_LIBCONTAINER_INITTYPE="+string(initStandard))
 	nsMaps := make(map[configs.NamespaceType]string)
 	for _, ns := range c.config.Namespaces {
 		if ns.Path != "" {
 			nsMaps[ns.Type] = ns.Path
 		}
 	}
-	data, err := c.bootstrapData(c.config.Namespaces.CloneFlags(), nsMaps)
-	if err != nil {
+	if err := c.setupNsenter(cfg, c.config.Namespaces.CloneFlags(), nsMaps); err != nil {
 		return nil, err
 	}
 
 	init := &initProcess{
 		containerProcess: containerProcess{
-			cmd:           cmd,
-			comm:          comm,
-			manager:       c.cgroupManager,
-			config:        c.newInitConfig(p),
-			process:       p,
-			bootstrapData: data,
-			container:     c,
+			nsenterCfg: *cfg,
+			comm:       comm,
+			manager:    c.cgroupManager,
+			config:     c.newInitConfig(p),
+			process:    p,
+			container:  c,
 		},
 		intelRdtManager: c.intelRdtManager,
 	}
@@ -686,24 +629,22 @@ func (c *Container) newInitProcess(p *Process, cmd *exec.Cmd, comm *processComm)
 	return init, nil
 }
 
-func (c *Container) newSetnsProcess(p *Process, cmd *exec.Cmd, comm *processComm) (*setnsProcess, error) {
-	cmd.Env = append(cmd.Env, "_LIBCONTAINER_INITTYPE="+string(initSetns))
+func (c *Container) newSetnsProcess(p *Process, cfg *nsenter.Config, comm *processComm) (*setnsProcess, error) {
+	cfg.Env = append(cfg.Env, "_LIBCONTAINER_INITTYPE="+string(initSetns))
 	state := c.currentState()
 	// for setns process, we don't have to set cloneflags as the process namespaces
 	// will only be set via setns syscall
-	data, err := c.bootstrapData(0, state.NamespacePaths)
-	if err != nil {
+	if err := c.setupNsenter(cfg, 0, state.NamespacePaths); err != nil {
 		return nil, err
 	}
 	proc := &setnsProcess{
 		containerProcess: containerProcess{
-			cmd:           cmd,
-			comm:          comm,
-			manager:       c.cgroupManager,
-			config:        c.newInitConfig(p),
-			process:       p,
-			bootstrapData: data,
-			container:     c,
+			nsenterCfg: *cfg,
+			comm:       comm,
+			manager:    c.cgroupManager,
+			config:     c.newInitConfig(p),
+			process:    p,
+			container:  c,
 		},
 		rootlessCgroups: c.config.RootlessCgroups,
 		intelRdtPath:    state.IntelRdtPath,
@@ -1053,144 +994,66 @@ func (c *Container) orderNamespacePaths(namespaces map[configs.NamespaceType]str
 	return paths, nil
 }
 
-func encodeIDMapping(idMap []configs.IDMap) ([]byte, error) {
-	data := bytes.NewBuffer(nil)
+func encodeIDMapping(idMap []configs.IDMap) string {
+	var data strings.Builder
 	for _, im := range idMap {
-		line := fmt.Sprintf("%d %d %d\n", im.ContainerID, im.HostID, im.Size)
-		if _, err := data.WriteString(line); err != nil {
-			return nil, err
-		}
+		fmt.Fprintf(&data, "%d %d %d\n", im.ContainerID, im.HostID, im.Size)
 	}
-	return data.Bytes(), nil
+	return data.String()
 }
 
-// netlinkError is an error wrapper type for use by custom netlink message
-// types. Panics with errors are wrapped in netlinkError so that the recover
-// in bootstrapData can distinguish intentional panics.
-type netlinkError struct{ error }
+// setupNsenter populates the namespace, userns mapping, oom_score_adj, and
+// timens offset fields of cfg.
+func (c *Container) setupNsenter(cfg *nsenter.Config, cloneFlags uintptr, nsMaps map[configs.NamespaceType]string) error {
+	cfg.CloneFlags = cloneFlags
 
-// bootstrapData encodes the necessary data in netlink binary format
-// as a io.Reader.
-// Consumer can write the data to a bootstrap program
-// such as one that uses nsenter package to bootstrap the container's
-// init process correctly, i.e. with correct namespaces, uid/gid
-// mapping etc.
-func (c *Container) bootstrapData(cloneFlags uintptr, nsMaps map[configs.NamespaceType]string) (_ io.Reader, Err error) {
-	// create the netlink message
-	r := nl.NewNetlinkRequest(int(InitMsg), 0)
-
-	// Our custom messages cannot bubble up an error using returns, instead
-	// they will panic with the specific error type, netlinkError. In that
-	// case, recover from the panic and return that as an error.
-	defer func() {
-		if r := recover(); r != nil {
-			if e, ok := r.(netlinkError); ok {
-				Err = e.error
-			} else {
-				panic(r)
-			}
-		}
-	}()
-
-	// write cloneFlags
-	r.AddData(&Int32msg{
-		Type:  CloneFlagsAttr,
-		Value: uint32(cloneFlags),
-	})
-
-	// write custom namespace paths
 	if len(nsMaps) > 0 {
 		nsPaths, err := c.orderNamespacePaths(nsMaps)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		r.AddData(&Bytemsg{
-			Type:  NsPathsAttr,
-			Value: []byte(strings.Join(nsPaths, ",")),
-		})
+		cfg.Namespaces = nsPaths
 	}
 
-	// write namespace paths only when we are not joining an existing user ns
+	// Set userns mappings only when we are not joining an existing user ns.
 	_, joinExistingUser := nsMaps[configs.NEWUSER]
 	if !joinExistingUser {
-		// write uid mappings
 		if len(c.config.UIDMappings) > 0 {
 			if c.config.RootlessEUID {
-				// We resolve the paths for new{u,g}idmap from
-				// the context of runc to avoid doing a path
-				// lookup in the nsenter context.
 				if path, err := exec.LookPath("newuidmap"); err == nil {
-					r.AddData(&Bytemsg{
-						Type:  UidmapPathAttr,
-						Value: []byte(path),
-					})
+					cfg.UIDMapPath = path
 				}
 			}
-			b, err := encodeIDMapping(c.config.UIDMappings)
-			if err != nil {
-				return nil, err
-			}
-			r.AddData(&Bytemsg{
-				Type:  UidmapAttr,
-				Value: b,
-			})
+			cfg.UIDMap = encodeIDMapping(c.config.UIDMappings)
 		}
 
-		// write gid mappings
 		if len(c.config.GIDMappings) > 0 {
-			b, err := encodeIDMapping(c.config.GIDMappings)
-			if err != nil {
-				return nil, err
-			}
-			r.AddData(&Bytemsg{
-				Type:  GidmapAttr,
-				Value: b,
-			})
+			cfg.GIDMap = encodeIDMapping(c.config.GIDMappings)
 			if c.config.RootlessEUID {
 				if path, err := exec.LookPath("newgidmap"); err == nil {
-					r.AddData(&Bytemsg{
-						Type:  GidmapPathAttr,
-						Value: []byte(path),
-					})
+					cfg.GIDMapPath = path
 				}
 			}
 			if requiresRootOrMappingTool(c.config) {
-				r.AddData(&Boolmsg{
-					Type:  SetgroupAttr,
-					Value: true,
-				})
+				cfg.Setgroups = true
 			}
 		}
 	}
 
-	if c.config.OomScoreAdj != nil {
-		// write oom_score_adj
-		r.AddData(&Bytemsg{
-			Type:  OomScoreAdjAttr,
-			Value: []byte(strconv.Itoa(*c.config.OomScoreAdj)),
-		})
-	}
+	cfg.OomScoreAdj = c.config.OomScoreAdj
+	cfg.RootlessEUID = c.config.RootlessEUID
 
-	// write rootless
-	r.AddData(&Boolmsg{
-		Type:  RootlessEUIDAttr,
-		Value: c.config.RootlessEUID,
-	})
-
-	// write boottime and monotonic time ns offsets only when we are not joining an existing time ns
+	// Write boottime and monotonic time ns offsets only when we are not joining an existing time ns.
 	_, joinExistingTime := nsMaps[configs.NEWTIME]
 	if !joinExistingTime && c.config.TimeOffsets != nil {
 		var offsetSpec bytes.Buffer
 		for clock, offset := range c.config.TimeOffsets {
 			fmt.Fprintf(&offsetSpec, "%s %d %d\n", clock, offset.Secs, offset.Nanosecs)
 		}
-		r.AddData(&Bytemsg{
-			Type:  TimeOffsetsAttr,
-			Value: offsetSpec.Bytes(),
-		})
+		cfg.TimeOffsets = offsetSpec.String()
 	}
 
-	return bytes.NewReader(r.Serialize()), nil
+	return nil
 }
 
 // ignoreTerminateErrors returns nil if the given err matches an error known
