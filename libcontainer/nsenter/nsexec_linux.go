@@ -116,15 +116,15 @@ func nssetToStr(set uintptr) string {
 }
 
 type nsexec struct {
-	cfg            *Config
-	ns             []nsEntry
-	mntnsFd        int
-	ownExeFd       int
-	syncChild      [2]int
-	syncGrandchild [2]int
-	stage1Pid      int
-	stage2Pid      int
-	stage2Proc     *os.Process
+	cfg        *Config
+	ns         []nsEntry
+	mntnsFd    int
+	cgroupNsFd int
+	ownExeFd   int
+	syncSock   [2]int
+	stage1Pid  int
+	stage2Pid  int
+	stage2Proc *os.Process
 }
 
 func closeFd(fd *int) {
@@ -146,19 +146,18 @@ func reapPid(pid int) {
 }
 
 func (s *nsexec) closeChildFds() {
-	closeFd(&s.syncChild[0])
-	closeFd(&s.syncGrandchild[0])
+	closeFd(&s.syncSock[0])
 	for i := range s.ns {
 		closeFd(&s.ns[i].fd)
 	}
 	closeFd(&s.mntnsFd)
+	closeFd(&s.cgroupNsFd)
 	closeFd(&s.ownExeFd)
 }
 
 func (s *nsexec) cleanup(failed bool) {
 	s.closeChildFds()
-	closeFd(&s.syncChild[1])
-	closeFd(&s.syncGrandchild[1])
+	closeFd(&s.syncSock[1])
 	if failed {
 		if s.stage1Pid > 0 {
 			_ = unix.Kill(s.stage1Pid, unix.SIGKILL)
@@ -409,6 +408,8 @@ func (s *nsexec) childError(stage string, msg syncMsg) error {
 		name := "unknown"
 		if int(msg.Arg2) < len(s.ns) {
 			name = s.ns[msg.Arg2].name
+		} else if int(msg.Arg2) == len(s.ns) {
+			name = "cgroup"
 		}
 		return fmt.Errorf("failed to setns into %s namespace: %w", name, errno)
 	case stepJoinNamespaces:
@@ -466,13 +467,13 @@ func (s *nsexec) childError(stage string, msg syncMsg) error {
 // Exec reaps stage-1 and returns the *os.Process for stage-2 (runc init).
 func (c *Config) Exec() (_ *os.Process, retErr error) {
 	s := &nsexec{
-		cfg:            c,
-		mntnsFd:        -1,
-		ownExeFd:       -1,
-		syncChild:      [2]int{-1, -1},
-		syncGrandchild: [2]int{-1, -1},
-		stage1Pid:      -1,
-		stage2Pid:      -1,
+		cfg:        c,
+		mntnsFd:    -1,
+		cgroupNsFd: -1,
+		ownExeFd:   -1,
+		syncSock:   [2]int{-1, -1},
+		stage1Pid:  -1,
+		stage2Pid:  -1,
 	}
 	defer func() {
 		s.cleanup(retErr != nil)
@@ -502,10 +503,27 @@ func (c *Config) Exec() (_ *os.Process, retErr error) {
 	//
 	// Note that creating a new mount namespace (unshare(CLONE_NEWNS)) is
 	// fine, as it is a copy of the current one.
-	for i, ns := range s.ns {
-		if ns.typ == unix.CLONE_NEWNS {
-			s.mntnsFd = ns.fd
+	for i := 0; i < len(s.ns); {
+		switch s.ns[i].typ {
+		case unix.CLONE_NEWNS:
+			s.mntnsFd = s.ns[i].fd
 			s.ns = append(s.ns[:i], s.ns[i+1:]...)
+		case unix.CLONE_NEWCGROUP:
+			if c.PrepareStage1 != nil {
+				s.cgroupNsFd = s.ns[i].fd
+				s.ns = append(s.ns[:i], s.ns[i+1:]...)
+				continue
+			}
+			i++
+		default:
+			i++
+		}
+	}
+
+	hasTimeNs := c.CloneFlags&unix.CLONE_NEWTIME != 0
+	for _, ns := range s.ns {
+		if ns.typ == unix.CLONE_NEWTIME {
+			hasTimeNs = true
 			break
 		}
 	}
@@ -515,8 +533,12 @@ func (c *Config) Exec() (_ *os.Process, retErr error) {
 	stage2Name, _ := unix.BytePtrFromString("runc:[2:INIT]")
 
 	a := &childArgs{
-		cloneFlags:  uint32ToUintptr(uint32(c.CloneFlags)) &^ unix.CLONE_NEWUSER,
+		waitOOM:     c.OomScoreAdj != nil,
+		waitPrep:    c.PrepareStage1 != nil,
+		cgroupNsFd:  s.cgroupNsFd,
+		cloneFlags:  uint32ToUintptr(uint32(c.CloneFlags)) &^ (unix.CLONE_NEWUSER | unix.CLONE_NEWCGROUP),
 		newUserns:   c.CloneFlags&unix.CLONE_NEWUSER != 0,
+		newCgroupns: c.CloneFlags&unix.CLONE_NEWCGROUP != 0,
 		nonDumpable: nonDumpable,
 		timens:      c.TimeOffsets != "",
 		setgroups:   !c.RootlessEUID && c.Setgroups,
@@ -525,6 +547,8 @@ func (c *Config) Exec() (_ *os.Process, retErr error) {
 		stage1Name:  stage1Name,
 		stage2Name:  stage2Name,
 	}
+	a.vforkStage2 = !hasTimeNs
+	a.vforkStage1 = !a.waitOOM && !a.newUserns && !a.timens && !a.waitPrep && !hasTimeNs
 	if c.Dir != "" {
 		dirPtr, err := unix.BytePtrFromString(c.Dir)
 		if err != nil {
@@ -621,19 +645,13 @@ func (c *Config) Exec() (_ *os.Process, retErr error) {
 		return nil, fmt.Errorf("invalid environment: %w", err)
 	}
 
-	// Socket pairs to sync with the child and grandchild.
-	childPair, err := unix.Socketpair(unix.AF_LOCAL, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	// Socket pair to sync with stage-1 and stage-2.
+	pair, err := unix.Socketpair(unix.AF_LOCAL, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to setup sync pipe between parent and child: %w", err)
 	}
-	s.syncChild = [2]int{childPair[0], childPair[1]}
-	grandchildPair, err := unix.Socketpair(unix.AF_LOCAL, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to setup sync pipe between parent and grandchild: %w", err)
-	}
-	s.syncGrandchild = [2]int{grandchildPair[0], grandchildPair[1]}
-	a.syncChild = s.syncChild
-	a.syncGrandchild = s.syncGrandchild
+	s.syncSock = [2]int{pair[0], pair[1]}
+	a.syncSock = s.syncSock
 
 	nextFd := len(files)
 	for _, fd := range files {
@@ -641,8 +659,8 @@ func (c *Config) Exec() (_ *os.Process, retErr error) {
 			nextFd = fd
 		}
 	}
-	if a.syncGrandchild[0] > nextFd {
-		nextFd = a.syncGrandchild[0]
+	if a.syncSock[0] > nextFd {
+		nextFd = a.syncSock[0]
 	}
 	if a.exeFd > nextFd {
 		nextFd = a.exeFd
@@ -676,29 +694,32 @@ func (c *Config) Exec() (_ *os.Process, retErr error) {
 	// Close the fds which are only used by the children.
 	s.closeChildFds()
 
-	// Configure oom_score_adj and cgroups/affinity/RDT on stage-1 while it
-	// is still dumpable and in the host namespaces.
-	if err := s.updateOomScoreAdj(s.stage1Pid); err != nil {
-		return nil, err
+	syncfd := s.syncSock[1]
+	if a.waitOOM {
+		if err := s.updateOomScoreAdj(s.stage1Pid); err != nil {
+			return nil, err
+		}
+		if err := s.writeSync(syncfd, syncStage1OOM, "failed to sync with stage-1: write(SYNC_STAGE1_OOM)"); err != nil {
+			return nil, err
+		}
 	}
-	if c.PrepareStage1 != nil {
+	if a.waitPrep && !a.newUserns && !a.timens {
 		if err := c.PrepareStage1(s.stage1Pid); err != nil {
+			return nil, err
+		}
+		if err := s.writeSync(syncfd, syncStage1Start, "failed to sync with stage-1: write(SYNC_STAGE1_START)"); err != nil {
 			return nil, err
 		}
 	}
 
-	syncfd := s.syncChild[1]
-	logrus.Debug("nsexec: -> stage-1 synchronisation loop")
-	if err := s.writeSync(syncfd, syncStage1Start, "failed to sync with stage-1: write(SYNC_STAGE1_START)"); err != nil {
-		return nil, err
-	}
-	for stage1Complete := false; !stage1Complete; {
-		msg, ok, err := s.readSync(syncfd, "failed to sync with stage-1: next state")
+	var childErr error
+	for {
+		msg, ok, err := s.readSync(syncfd, "failed to sync with child: next state")
 		if err != nil {
 			return nil, err
 		}
 		if !ok {
-			return nil, errors.New("failed to sync with stage-1: next state: unexpected EOF")
+			break
 		}
 		switch msg.Type {
 		case syncUsermapPls:
@@ -721,17 +742,6 @@ func (c *Config) Exec() (_ *os.Process, retErr error) {
 			if err := s.writeSync(syncfd, syncUsermapAck, "failed to sync with stage-1: write(SYNC_USERMAP_ACK)"); err != nil {
 				return nil, err
 			}
-		case syncRecvPidPls:
-			logrus.Debug("nsexec: stage-1 requested pid to be forwarded")
-			s.stage2Pid = int(int32(msg.Arg0))
-			proc, err := os.FindProcess(s.stage2Pid)
-			if err != nil {
-				return nil, fmt.Errorf("failed to find stage-2 process %d: %w", s.stage2Pid, err)
-			}
-			s.stage2Proc = proc
-			if err := s.writeSync(syncfd, syncRecvPidAck, "failed to sync with stage-1: write(SYNC_RECVPID_ACK)"); err != nil {
-				return nil, err
-			}
 		case syncTimeOffsetsPls:
 			logrus.Debug("nsexec: stage-1 requested timens offsets to be configured")
 			if err := s.updateTimeNsOffsets(s.stage1Pid); err != nil {
@@ -740,64 +750,41 @@ func (c *Config) Exec() (_ *os.Process, retErr error) {
 			if err := s.writeSync(syncfd, syncTimeOffsetsAck, "failed to sync with child: write(SYNC_TIMEOFFSETS_ACK)"); err != nil {
 				return nil, err
 			}
-		case syncChildFinish:
-			logrus.Debug("nsexec: stage-1 complete")
-			stage1Complete = true
-			reapPid(s.stage1Pid)
-			s.stage1Pid = -1
-		case syncError:
-			return nil, s.childError("stage-1", msg)
+		case syncStage1Ready:
+			if err := c.PrepareStage1(s.stage1Pid); err != nil {
+				return nil, err
+			}
+			if err := s.writeSync(syncfd, syncStage1Start, "failed to sync with stage-1: write(SYNC_STAGE1_START)"); err != nil {
+				return nil, err
+			}
+		case syncRecvPidPls:
+			logrus.Debug("nsexec: stage-1 sent stage-2 pid")
+			s.stage2Pid = int(int32(msg.Arg0))
+		case syncErrorStage1:
+			if childErr == nil {
+				childErr = s.childError("stage-1", msg)
+			}
+		case syncErrorStage2:
+			if childErr == nil {
+				childErr = s.childError("stage-2", msg)
+			}
 		default:
-			return nil, fmt.Errorf("unexpected sync value from stage-1: %#x", msg.Type)
+			return nil, fmt.Errorf("unexpected sync value from child: %#x", msg.Type)
 		}
 	}
-	logrus.Debug("nsexec: <- stage-1 synchronisation loop")
-
-	// Now sync with grandchild (stage-2).
-	closeFd(&s.syncChild[1])
-	syncfd = s.syncGrandchild[1]
-
-	logrus.Debug("nsexec: -> stage-2 synchronisation loop")
-	logrus.Debug("nsexec: signalling stage-2 to run")
-	if err := s.writeSync(syncfd, syncGrandchild, "failed to sync with child: write(SYNC_GRANDCHILD)"); err != nil {
-		return nil, err
+	reapPid(s.stage1Pid)
+	s.stage1Pid = -1
+	if childErr != nil {
+		return nil, childErr
 	}
-	msg, ok, err := s.readSync(syncfd, "failed to sync with child: next state")
+	if s.stage2Pid <= 0 {
+		return nil, errors.New("failed to sync with stage-1: next state: unexpected EOF")
+	}
+	proc, err := os.FindProcess(s.stage2Pid)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to find stage-2 process %d: %w", s.stage2Pid, err)
 	}
-	if !ok {
-		return nil, errors.New("failed to sync with stage-2: unexpected EOF")
-	}
-	switch msg.Type {
-	case syncChildFinish:
-		switch msg.Arg0 {
-		case nondumpCaps:
-			logrus.Debug("nsexec: stage-2 will be non-dumpable after exec (capability regained)")
-		case nondumpGid:
-			logrus.Debug("nsexec: stage-2 will be non-dumpable after exec (real and effective gids differ)")
-		default:
-			logrus.Debug("nsexec: stage-2 will be dumpable after exec")
-		}
-	case syncError:
-		return nil, s.childError("stage-2", msg)
-	default:
-		return nil, fmt.Errorf("unexpected sync value from stage-2: %#x", msg.Type)
-	}
-	// Stage-2 is about to execute runc init; the sync socket is O_CLOEXEC,
-	// so we get EOF once it succeeded, or an error message otherwise.
-	msg, ok, err = s.readSync(syncfd, "failed to sync with child: exec")
-	if err != nil {
-		return nil, err
-	}
-	if ok {
-		if msg.Type == syncError {
-			return nil, s.childError("stage-2", msg)
-		}
-		return nil, fmt.Errorf("unexpected sync value from stage-2: %#x", msg.Type)
-	}
-	logrus.Debug("nsexec: stage-2 complete")
-	logrus.Debug("nsexec: <- stage-2 synchronisation loop")
+	s.stage2Proc = proc
 	logrus.Debug("nsexec: <= nsexec container setup")
 	return s.stage2Proc, nil
 }

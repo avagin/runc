@@ -20,18 +20,20 @@ func afterFork()
 //go:linkname afterForkInChild syscall.runtime_AfterForkInChild
 func afterForkInChild()
 
+func rawVforkSyscall(trap, a1, a2, a3 uintptr) (r1 uintptr, err syscall.Errno)
+
 // Synchronisation values. The values are the same as in former nsexec.c.
 const (
-	syncStage1Start    = 0x3f // Tell stage-1 to proceed after parent setup.
+	syncStage1OOM      = 0x3e // Tell stage-1 that oom_score_adj has been written.
+	syncStage1Start    = 0x3f // Tell stage-1 that PrepareStage1 has finished.
 	syncUsermapPls     = 0x40 // Request parent to map our users.
 	syncUsermapAck     = 0x41 // Mapping finished by the parent.
 	syncRecvPidPls     = 0x42 // Tell parent we're sending the PID.
-	syncRecvPidAck     = 0x43 // PID was correctly received by parent.
-	syncGrandchild     = 0x44 // The grandchild is ready to run.
-	syncChildFinish    = 0x45 // The child or grandchild has finished.
+	syncStage1Ready    = 0x45 // Stage-1 is ready for PrepareStage1.
 	syncTimeOffsetsPls = 0x46 // Request parent to write timens offsets.
 	syncTimeOffsetsAck = 0x47 // Timens offsets were written.
-	syncError          = 0x48 // The child or grandchild has failed.
+	syncErrorStage1    = 0x48 // Stage-1 has failed.
+	syncErrorStage2    = 0x49 // Stage-2 has failed.
 )
 
 // Error steps, sent by stage-1 or stage-2 along with syncError.
@@ -105,22 +107,32 @@ type childArgs struct {
 	useClone3 bool
 	clone3    cloneArgs
 
-	// syncChild[0] is used by stage-1, syncChild[1] by the parent.
-	syncChild [2]int
-	// syncGrandchild[0] is used by stage-2, syncGrandchild[1] by the parent.
-	syncGrandchild [2]int
+	// Whether to use CLONE_VM | CLONE_VFORK when spawning stage-1 / stage-2.
+	vforkStage1 bool
+	vforkStage2 bool
+
+	// syncSock[0] is used by stage-1 and stage-2, syncSock[1] by the parent.
+	syncSock [2]int
+
+	// Whether stage-1 must wait for syncStage1OOM before PR_SET_DUMPABLE(0) / CLONE_NEWUSER.
+	waitOOM bool
+	// Whether stage-1 must wait for syncStage1Start before CLONE_NEWCGROUP and cloning stage-2.
+	waitPrep bool
 
 	// Working directory to chdir(2) into in stage-1 before setns/unshare, or nil.
 	dir *byte
 
 	// Namespaces to join (pre-opened by the parent).
-	nsFds   []int
-	nsTypes []uintptr
+	nsFds      []int
+	nsTypes    []uintptr
+	cgroupNsFd int
 
-	// Namespaces to create, except CLONE_NEWUSER.
+	// Namespaces to create, except CLONE_NEWUSER and CLONE_NEWCGROUP.
 	cloneFlags uintptr
 	// Whether to create a new user namespace.
 	newUserns bool
+	// Whether to create a new cgroup namespace.
+	newCgroupns bool
 	// Whether the child process should be made non-dumpable (because
 	// existing namespaces are being joined).
 	nonDumpable bool
@@ -271,13 +283,13 @@ func childRead(fd int, want uint32, pid uintptr) {
 	var msg syncMsg
 	n, _, err := syscall.RawSyscall(unix.SYS_READ, uintptr(fd), uintptr(unsafe.Pointer(&msg)), syncMsgSize)
 	if err != 0 {
-		childFail(fd, stepSyncRead, err, want, pid)
+		childFail(fd, syncErrorStage1, stepSyncRead, err, want, pid)
 	}
 	if n != syncMsgSize {
-		childFail(fd, stepSyncRead, syscall.EIO, want, pid)
+		childFail(fd, syncErrorStage1, stepSyncRead, syscall.EIO, want, pid)
 	}
 	if msg.Type != want {
-		childFail(fd, stepSyncUnexpected, 0, msg.Type, pid)
+		childFail(fd, syncErrorStage1, stepSyncUnexpected, 0, msg.Type, pid)
 	}
 }
 
@@ -285,9 +297,9 @@ func childRead(fd int, want uint32, pid uintptr) {
 //
 //go:nosplit
 //go:norace
-func childSend(fd int, typ, a0 uint32, pid uintptr) {
+func childSend(fd int, errType, typ, a0 uint32, pid uintptr) {
 	if err := childWrite(fd, typ, a0, 0, 0); err != 0 {
-		childFail(fd, stepSyncWrite, err, typ, pid)
+		childFail(fd, errType, stepSyncWrite, err, typ, pid)
 	}
 }
 
@@ -296,11 +308,11 @@ func childSend(fd int, typ, a0 uint32, pid uintptr) {
 //
 //go:nosplit
 //go:norace
-func childFail(fd int, step uint32, errno syscall.Errno, arg uint32, pid uintptr) {
+func childFail(fd int, errType, step uint32, errno syscall.Errno, arg uint32, pid uintptr) {
 	if pid != 0 {
 		syscall.RawSyscall(unix.SYS_KILL, pid, uintptr(syscall.SIGKILL), 0)
 	}
-	_ = childWrite(fd, syncError, uint32(errno), step, arg)
+	_ = childWrite(fd, errType, uint32(errno), step, arg)
 	for {
 		syscall.RawSyscall(unix.SYS_EXIT_GROUP, 1, 0, 0)
 	}
@@ -312,26 +324,6 @@ func childExit(code uintptr) {
 	for {
 		syscall.RawSyscall(unix.SYS_EXIT_GROUP, code, 0, 0)
 	}
-}
-
-// rawClone does clone(flags|SIGCHLD) without a new stack, i.e. it works like
-// fork(2), optionally with flags such as CLONE_PARENT.
-//
-//go:nosplit
-//go:norace
-func rawClone(flags uintptr) (uintptr, syscall.Errno) {
-	flags |= uintptr(syscall.SIGCHLD)
-	var (
-		pid uintptr
-		err syscall.Errno
-	)
-	if runtime.GOARCH == "s390x" {
-		// On Linux/s390, the first two arguments of clone(2) are swapped.
-		pid, _, err = syscall.RawSyscall6(unix.SYS_CLONE, 0, flags, 0, 0, 0, 0)
-	} else {
-		pid, _, err = syscall.RawSyscall6(unix.SYS_CLONE, flags, 0, 0, 0, 0, 0)
-	}
-	return pid, err
 }
 
 // tryUnshare calls unshare(2), retrying on EINVAL. Kernels prior to v4.3 may
@@ -366,6 +358,26 @@ func tryUnshare(flags uintptr) syscall.Errno {
 //go:norace
 //go:nocheckptr
 func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
+	var origDumpable uintptr
+	if a.vforkStage1 && a.nonDumpable {
+		origDumpable, _, _ = syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_GET_DUMPABLE, 0, 0, 0, 0, 0)
+	}
+
+	pid, errno = spawnStage1(a)
+	if a.vforkStage1 && a.nonDumpable && origDumpable == 1 {
+		syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_DUMPABLE, 1, 0, 0, 0, 0)
+	}
+	afterFork()
+	return
+}
+
+// spawnStage1 is separated from spawnChildren so that the parent and stage-1
+// do not share the same active stack frame when CLONE_VFORK is used.
+//
+//go:noinline
+//go:norace
+//go:nocheckptr
+func spawnStage1(a *childArgs) (pid uintptr, errno syscall.Errno) {
 	// Declare all variables at the top, so that there's no need for any
 	// allocation after beforeFork.
 	var (
@@ -379,21 +391,32 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 		allDone uint64
 		stage2  uintptr
 		sfd     int
-		nextfd  int
-		mode    uint32
+		flags   uintptr
 	)
 
 	// About to call fork. No more allocation or calls
 	// of non-nosplit functions. This also blocks all signals.
 	beforeFork()
 	if a.useClone3 {
-		pid, _, errno = syscall.RawSyscall(unix.SYS_CLONE3, uintptr(unsafe.Pointer(&a.clone3)), unsafe.Sizeof(a.clone3), 0)
+		if a.vforkStage1 {
+			a.clone3.flags |= unix.CLONE_VM | unix.CLONE_VFORK
+		}
+		pid, errno = rawVforkSyscall(unix.SYS_CLONE3, uintptr(unsafe.Pointer(&a.clone3)), unsafe.Sizeof(a.clone3), 0)
 	} else {
-		pid, errno = rawClone(0)
+		flags = uintptr(syscall.SIGCHLD)
+		if a.vforkStage1 {
+			flags |= unix.CLONE_VM | unix.CLONE_VFORK
+		}
+		if runtime.GOARCH == "s390x" {
+			// On Linux/s390, the first two arguments of clone(2) are swapped.
+			pid, errno = rawVforkSyscall(unix.SYS_CLONE, 0, flags, 0)
+		} else {
+			pid, errno = rawVforkSyscall(unix.SYS_CLONE, flags, 0, 0)
+		}
 	}
 	if errno != 0 || pid != 0 {
-		// The parent.
-		afterFork()
+		// In the parent, return immediately so we do not share the
+		// stack frame with the child when using vfork.
 		return
 	}
 
@@ -404,18 +427,19 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 	// our parent to set up our user mappings for us. Then, we create a new
 	// child (stage-2) with CLONE_PARENT for PID namespace, and send its
 	// PID to our parent.
-	sfd = a.syncChild[0]
-	syscall.RawSyscall(unix.SYS_CLOSE, uintptr(a.syncChild[1]), 0, 0)
+	sfd = a.syncSock[0]
+	syscall.RawSyscall(unix.SYS_CLOSE, uintptr(a.syncSock[1]), 0, 0)
 	syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_NAME, uintptr(unsafe.Pointer(a.stage1Name)), 0, 0, 0, 0)
 
-	// Wait for the parent to configure cgroups, CPU affinity, Intel RDT,
-	// and oom_score_adj on us while we are still dumpable and in the host
-	// namespaces.
-	childRead(sfd, syncStage1Start, 0)
+	// Wait for the parent to write oom_score_adj while we are still
+	// dumpable and in the host user namespace.
+	if a.waitOOM {
+		childRead(sfd, syncStage1OOM, 0)
+	}
 
 	if a.dir != nil {
 		if _, _, err1 = syscall.RawSyscall(unix.SYS_CHDIR, uintptr(unsafe.Pointer(a.dir)), 0, 0); err1 != 0 {
-			childFail(sfd, stepChdir, err1, 0, 0)
+			childFail(sfd, syncErrorStage1, stepChdir, err1, 0, 0)
 		}
 	}
 
@@ -424,7 +448,7 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 	// joining to access host resources.
 	if a.nonDumpable {
 		if _, _, err1 = syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_DUMPABLE, 0, 0, 0, 0, 0); err1 != 0 {
-			childFail(sfd, stepSetDumpable, err1, 0, 0)
+			childFail(sfd, syncErrorStage1, stepSetDumpable, err1, 0, 0)
 		}
 	}
 
@@ -459,7 +483,7 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 					continue
 				}
 				if err1 != 0 {
-					childFail(sfd, stepSetns, err1, uint32(i), 0)
+					childFail(sfd, syncErrorStage1, stepSetns, err1, uint32(i), 0)
 				}
 				joined |= a.nsTypes[i]
 				done |= 1 << uint(i)
@@ -471,7 +495,7 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 				// https://github.com/opencontainers/runc/issues/4466.
 				if a.nsTypes[i] == unix.CLONE_NEWUSER {
 					if _, _, err1 = syscall.RawSyscall(sysSetresuid, 0, 0, 0); err1 != 0 {
-						childFail(sfd, stepSetresuidUserns, err1, 0, 0)
+						childFail(sfd, syncErrorStage1, stepSetresuidUserns, err1, 0, 0)
 					}
 				}
 				syscall.RawSyscall(unix.SYS_CLOSE, uintptr(a.nsFds[i]), 0, 0)
@@ -479,7 +503,7 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 		}
 		// Make sure we joined all the namespaces we planned to.
 		if done != allDone {
-			childFail(sfd, stepJoinNamespaces, syscall.EPERM, uint32(done), 0)
+			childFail(sfd, syncErrorStage1, stepJoinNamespaces, syscall.EPERM, uint32(done), 0)
 		}
 	}
 
@@ -495,105 +519,155 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 	// if the UTS namespace is cloned before the USER namespace is mapped).
 	if a.newUserns {
 		if err1 = tryUnshare(unix.CLONE_NEWUSER); err1 != 0 {
-			childFail(sfd, stepUnshareUserns, err1, 0, 0)
+			childFail(sfd, syncErrorStage1, stepUnshareUserns, err1, 0, 0)
 		}
 		// We need to set ourselves as dumpable temporarily so that the
 		// parent process can write to our procfs files.
 		if a.nonDumpable {
 			if _, _, err1 = syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_DUMPABLE, 1, 0, 0, 0, 0); err1 != 0 {
-				childFail(sfd, stepSetDumpable, err1, 1, 0)
+				childFail(sfd, syncErrorStage1, stepSetDumpable, err1, 1, 0)
 			}
 		}
 		// We don't have the privileges to do any mapping here, so
 		// signal the parent to do the mapping for us.
-		childSend(sfd, syncUsermapPls, 0, 0)
+		childSend(sfd, syncErrorStage1, syncUsermapPls, 0, 0)
 		childRead(sfd, syncUsermapAck, 0)
 		// Revert temporary re-dumpable setting.
 		if a.nonDumpable {
 			if _, _, err1 = syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_DUMPABLE, 0, 0, 0, 0, 0); err1 != 0 {
-				childFail(sfd, stepSetDumpable, err1, 0, 0)
+				childFail(sfd, syncErrorStage1, stepSetDumpable, err1, 0, 0)
 			}
 		}
 		// Become root in the namespace proper.
 		if _, _, err1 = syscall.RawSyscall(sysSetresuid, 0, 0, 0); err1 != 0 {
-			childFail(sfd, stepSetresuidUserns, err1, 0, 0)
+			childFail(sfd, syncErrorStage1, stepSetresuidUserns, err1, 0, 0)
 		}
 	}
 
-	// Unshare all of the remaining namespaces. Note that we don't merge
-	// this with clone() because there were some old kernel versions where
+	// Unshare all of the remaining namespaces (except cgroupns, which must
+	// wait for PrepareStage1). Note that we don't merge this with clone()
+	// because there were some old kernel versions where
 	// clone(CLONE_PARENT | CLONE_NEWPID) was broken.
-	if err1 = tryUnshare(a.cloneFlags); err1 != 0 {
-		childFail(sfd, stepUnshare, err1, 0, 0)
+	if a.cloneFlags != 0 {
+		if err1 = tryUnshare(a.cloneFlags); err1 != 0 {
+			childFail(sfd, syncErrorStage1, stepUnshare, err1, 0, 0)
+		}
 	}
 
 	if a.timens {
-		childSend(sfd, syncTimeOffsetsPls, 0, 0)
+		childSend(sfd, syncErrorStage1, syncTimeOffsetsPls, 0, 0)
 		childRead(sfd, syncTimeOffsetsAck, 0)
+	}
+
+	// Wait for the parent to finish PrepareStage1 (configuring cgroups,
+	// CPU affinity, and Intel RDT) before unsharing/joining cgroupns and
+	// cloning stage-2.
+	if a.waitPrep {
+		if a.newUserns || a.timens {
+			childSend(sfd, syncErrorStage1, syncStage1Ready, 0, 0)
+		}
+		childRead(sfd, syncStage1Start, 0)
+	}
+
+	if a.cgroupNsFd >= 0 {
+		if _, _, err1 = syscall.RawSyscall(unix.SYS_SETNS, uintptr(a.cgroupNsFd), unix.CLONE_NEWCGROUP, 0); err1 != 0 {
+			childFail(sfd, syncErrorStage1, stepSetns, err1, uint32(len(a.nsFds)), 0)
+		}
+		syscall.RawSyscall(unix.SYS_CLOSE, uintptr(a.cgroupNsFd), 0, 0)
+	}
+	if a.newCgroupns {
+		if err1 = tryUnshare(unix.CLONE_NEWCGROUP); err1 != 0 {
+			childFail(sfd, syncErrorStage1, stepUnshare, err1, 0, 0)
+		}
 	}
 
 	// We fork again because of PID namespace, setns(2) or unshare(2) don't
 	// change the PID namespace of the calling process, so we must fork to
 	// actually enter the new PID namespace. We use CLONE_PARENT so that
 	// stage-2 is a direct child of the parent process.
-	stage2, err1 = rawClone(unix.CLONE_PARENT)
+	stage2, err1 = spawnStage2(a)
 	if err1 != 0 {
-		childFail(sfd, stepCloneStage2, err1, 0, 0)
+		childFail(sfd, syncErrorStage1, stepCloneStage2, err1, 0, 0)
 	}
-	if stage2 != 0 {
-		// Still stage-1. Close our copy of the stage-2 sync socket, so
-		// that the parent can detect when stage-2 exits or execs.
-		syscall.RawSyscall(unix.SYS_CLOSE, uintptr(a.syncGrandchild[0]), 0, 0)
-		// Send the child PID to our parent.
-		childSend(sfd, syncRecvPidPls, uint32(stage2), stage2)
-		childRead(sfd, syncRecvPidAck, stage2)
-		childSend(sfd, syncChildFinish, 0, stage2)
-		// Our work is done. Stage-2 is doing the rest of the work.
-		childExit(0)
+	// Send the child PID to our parent.
+	childSend(a.syncSock[0], syncErrorStage1, syncRecvPidPls, uint32(stage2), stage2)
+	// Our work is done. Stage-2 is doing the rest of the work.
+	childExit(0)
+	return
+}
+
+// spawnStage2 is separated from spawnStage1 so that stage-1 and stage-2
+// do not share the same active stack frame when CLONE_VFORK is used.
+//
+//go:noinline
+//go:nosplit
+//go:norace
+//go:nocheckptr
+func spawnStage2(a *childArgs) (pid uintptr, errno syscall.Errno) {
+	var (
+		err1   syscall.Errno
+		i      int
+		sfd    int
+		exeFd  int
+		nextfd int
+		flags  uintptr
+	)
+
+	flags = unix.CLONE_PARENT | uintptr(syscall.SIGCHLD)
+	if a.vforkStage2 {
+		flags |= unix.CLONE_VM | unix.CLONE_VFORK
+	}
+	if runtime.GOARCH == "s390x" {
+		// On Linux/s390, the first two arguments of clone(2) are swapped.
+		pid, errno = rawVforkSyscall(unix.SYS_CLONE, 0, flags, 0)
+	} else {
+		pid, errno = rawVforkSyscall(unix.SYS_CLONE, flags, 0, 0)
+	}
+	if errno != 0 || pid != 0 {
+		// In stage-1, return immediately so we do not share the
+		// stack frame with stage-2 when using vfork.
+		return
 	}
 
 	// ----- Stage-2 -----
 	//
 	// We're the final child process. Our job is to do the final setup
 	// steps and then execute runc init in the new namespaces.
-	syscall.RawSyscall(unix.SYS_CLOSE, uintptr(sfd), 0, 0)
-	sfd = a.syncGrandchild[0]
-	syscall.RawSyscall(unix.SYS_CLOSE, uintptr(a.syncGrandchild[1]), 0, 0)
+	sfd = a.syncSock[0]
+	exeFd = a.exeFd
 	syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_NAME, uintptr(unsafe.Pointer(a.stage2Name)), 0, 0, 0, 0)
 
-	childRead(sfd, syncGrandchild, 0)
-
 	if _, _, err1 = syscall.RawSyscall(unix.SYS_SETSID, 0, 0, 0); err1 != 0 {
-		childFail(sfd, stepSetsid, err1, 0, 0)
+		childFail(sfd, syncErrorStage2, stepSetsid, err1, 0, 0)
 	}
 	if _, _, err1 = syscall.RawSyscall(sysSetresuid, 0, 0, 0); err1 != 0 {
-		childFail(sfd, stepSetuid, err1, 0, 0)
+		childFail(sfd, syncErrorStage2, stepSetuid, err1, 0, 0)
 	}
 	if _, _, err1 = syscall.RawSyscall(sysSetresgid, 0, 0, 0); err1 != 0 {
-		childFail(sfd, stepSetgid, err1, 0, 0)
+		childFail(sfd, syncErrorStage2, stepSetgid, err1, 0, 0)
 	}
 	if a.setgroups {
 		if _, _, err1 = syscall.RawSyscall(sysSetgroups, 0, 0, 0); err1 != 0 {
-			childFail(sfd, stepSetgroups, err1, 0, 0)
+			childFail(sfd, syncErrorStage2, stepSetgroups, err1, 0, 0)
 		}
 	}
 
 	// Place the inherited file descriptors at 0 .. len(a.files)-1.
-	// First, move sfd and a.exeFd above len(a.files) so pass 2 won't
+	// First, move sfd and exeFd above len(a.files) so pass 2 won't
 	// overwrite them.
 	nextfd = a.nextFd
 	if sfd < len(a.files) {
 		if _, _, err1 = syscall.RawSyscall(unix.SYS_DUP3, uintptr(sfd), uintptr(nextfd), unix.O_CLOEXEC); err1 != 0 {
-			childFail(sfd, stepDup, err1, 0, 0)
+			childFail(sfd, syncErrorStage2, stepDup, err1, 0, 0)
 		}
 		sfd = nextfd
 		nextfd++
 	}
-	if a.exeFd < len(a.files) {
-		if _, _, err1 = syscall.RawSyscall(unix.SYS_DUP3, uintptr(a.exeFd), uintptr(nextfd), unix.O_CLOEXEC); err1 != 0 {
-			childFail(sfd, stepDup, err1, 0, 0)
+	if exeFd < len(a.files) {
+		if _, _, err1 = syscall.RawSyscall(unix.SYS_DUP3, uintptr(exeFd), uintptr(nextfd), unix.O_CLOEXEC); err1 != 0 {
+			childFail(sfd, syncErrorStage2, stepDup, err1, 0, 0)
 		}
-		a.exeFd = nextfd
+		exeFd = nextfd
 		nextfd++
 	}
 	// Pass 1: move any a.files[i] < i above nextfd so pass 2 won't
@@ -601,7 +675,7 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 	for i = 0; i < len(a.files); i++ {
 		if a.files[i] >= 0 && a.files[i] < i {
 			if _, _, err1 = syscall.RawSyscall(unix.SYS_DUP3, uintptr(a.files[i]), uintptr(nextfd), unix.O_CLOEXEC); err1 != 0 {
-				childFail(sfd, stepDup, err1, 0, 0)
+				childFail(sfd, syncErrorStage2, stepDup, err1, 0, 0)
 			}
 			a.files[i] = nextfd
 			nextfd++
@@ -615,12 +689,12 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 		}
 		if a.files[i] == i {
 			if _, _, err1 = syscall.RawSyscall(unix.SYS_FCNTL, uintptr(i), unix.F_SETFD, 0); err1 != 0 {
-				childFail(sfd, stepDup, err1, 0, 0)
+				childFail(sfd, syncErrorStage2, stepDup, err1, 0, 0)
 			}
 			continue
 		}
 		if _, _, err1 = syscall.RawSyscall(unix.SYS_DUP3, uintptr(a.files[i]), uintptr(i), 0); err1 != 0 {
-			childFail(sfd, stepDup, err1, 0, 0)
+			childFail(sfd, syncErrorStage2, stepDup, err1, 0, 0)
 		}
 	}
 	// Mark any remaining fds >= len(a.files) as O_CLOEXEC.
@@ -632,29 +706,26 @@ func spawnChildren(a *childArgs) (pid uintptr, errno syscall.Errno) {
 	// the parent, so that the exec'ed runc init sees the original value.
 	if a.restoreNofile {
 		if _, _, err1 = syscall.RawSyscall6(unix.SYS_PRLIMIT64, 0, unix.RLIMIT_NOFILE, uintptr(unsafe.Pointer(&a.nofile)), 0, 0, 0); err1 != 0 {
-			childFail(sfd, stepSetrlimit, err1, 0, 0)
+			childFail(sfd, syncErrorStage2, stepSetrlimit, err1, 0, 0)
 		}
 	}
 
 	// This must be the last thing to do before execveat, as it might drop
 	// a capability.
-	mode, err1 = prepareNondumpExec(a)
-	if err1 != 0 {
-		childFail(sfd, stepNondumpable, err1, 0, 0)
+	if _, err1 = prepareNondumpExec(a); err1 != 0 {
+		childFail(sfd, syncErrorStage2, stepNondumpable, err1, 0, 0)
 	}
-
-	childSend(sfd, syncChildFinish, mode, 0)
 
 	// Reset signal handlers to their defaults and restore the signal mask.
 	afterForkInChild()
 
 	// Execute runc init. sfd is O_CLOEXEC, so the parent gets EOF once
 	// execveat succeeds.
-	_, _, err1 = syscall.RawSyscall6(unix.SYS_EXECVEAT, uintptr(a.exeFd),
+	_, _, err1 = syscall.RawSyscall6(unix.SYS_EXECVEAT, uintptr(exeFd),
 		uintptr(unsafe.Pointer(a.emptyPath)),
 		uintptr(unsafe.Pointer(&a.argv[0])),
 		uintptr(unsafe.Pointer(&a.envv[0])),
 		unix.AT_EMPTY_PATH, 0)
-	childFail(sfd, stepExec, err1, 0, 0)
+	childFail(sfd, syncErrorStage2, stepExec, err1, 0, 0)
 	return
 }

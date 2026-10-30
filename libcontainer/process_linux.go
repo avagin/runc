@@ -852,11 +852,11 @@ func (p *initProcess) start() (retErr error) {
 	defer p.comm.closeParent()
 
 	cgroupApplied := false
-	p.nsenterCfg.PrepareStage1 = func(stage1Pid int) error {
+	applyCgroups := func(pid int) error {
 		// Do this before syncing with child so that no children can escape the
 		// cgroup. We don't need to worry about not doing this and not being root
 		// because we'd be using the rootless cgroup manager in that case.
-		if err := p.manager.Apply(stage1Pid); err != nil {
+		if err := p.manager.Apply(pid); err != nil {
 			if errors.Is(err, cgroups.ErrRootless) {
 				// ErrRootless is to be ignored except when
 				// the container doesn't have private pidns.
@@ -873,13 +873,16 @@ func (p *initProcess) start() (retErr error) {
 		cgroupApplied = true
 		// Reset the CPU affinity after cgroups are configured to make sure it
 		// matches any configured cpuset.
-		tryResetCPUAffinity(stage1Pid)
+		tryResetCPUAffinity(pid)
 		if p.intelRdtManager != nil {
-			if err := p.intelRdtManager.Apply(stage1Pid); err != nil {
+			if err := p.intelRdtManager.Apply(pid); err != nil {
 				return fmt.Errorf("unable to apply Intel RDT configuration: %w", err)
 			}
 		}
 		return nil
+	}
+	if p.config.Config.Namespaces.IsPrivate(configs.NEWCGROUP) {
+		p.nsenterCfg.PrepareStage1 = applyCgroups
 	}
 
 	defer func() {
@@ -926,6 +929,16 @@ func (p *initProcess) start() (retErr error) {
 	}
 	p.process.ops = p
 
+	deferCgroups := !cgroupApplied && cgroups.IsCgroup2UnifiedMode() &&
+		p.config.CPUAffinity == nil &&
+		!p.config.Config.HasHook(configs.CreateContainer) &&
+		(p.config.Config.Cgroups == nil || p.config.Config.Cgroups.Resources == nil || p.config.Config.Cgroups.Resources.Memory == 0)
+	if !cgroupApplied && !deferCgroups {
+		if err := applyCgroups(p.pid()); err != nil {
+			return err
+		}
+	}
+
 	// Save the standard descriptor names before the container process
 	// can potentially move them (e.g., via dup2()).  If we don't do this now,
 	// we won't know at checkpoint time which file descriptor to look up.
@@ -970,6 +983,12 @@ func (p *initProcess) start() (retErr error) {
 
 	if err := utils.WriteJSON(p.comm.initSockParent, p.config); err != nil {
 		return fmt.Errorf("error sending config to init process: %w", err)
+	}
+
+	if !cgroupApplied {
+		if err := applyCgroups(p.pid()); err != nil {
+			return err
+		}
 	}
 
 	var seenProcReady bool
