@@ -9,6 +9,37 @@ import (
 	"github.com/opencontainers/runc/libcontainer"
 )
 
+func benchmarkRunTrue(b *testing.B, param *tParam) {
+	config := newTemplateConfig(b, param)
+	root := b.TempDir()
+
+	for b.Loop() {
+		container, err := libcontainer.Create(root, "bench", config)
+		ok(b, err)
+		process := &libcontainer.Process{
+			Cwd:      "/",
+			Args:     []string{"/bin/true"},
+			Env:      standardEnvironment,
+			Init:     true,
+			LogLevel: "0", // Minimize forwardChildLogs involvement.
+		}
+		err = container.Run(process)
+		ok(b, err)
+		waitProcess(process, b)
+		destroyContainer(container)
+	}
+	b.StopTimer()
+}
+
+func BenchmarkRunTrue(b *testing.B) {
+	benchmarkRunTrue(b, nil)
+}
+
+func BenchmarkRunTrueUserns(b *testing.B) {
+	needUserNS(b)
+	benchmarkRunTrue(b, &tParam{userns: true})
+}
+
 func BenchmarkExecTrue(b *testing.B) {
 	config := newTemplateConfig(b, nil)
 	container, err := newContainer(b, config)
