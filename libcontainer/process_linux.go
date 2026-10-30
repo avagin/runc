@@ -881,9 +881,10 @@ func (p *initProcess) start() (retErr error) {
 		}
 		return nil
 	}
-	if p.config.Config.Namespaces.IsPrivate(configs.NEWCGROUP) {
-		p.nsenterCfg.PrepareStage1 = applyCgroups
-	}
+	// If a new cgroup namespace is requested, unshare(CLONE_NEWCGROUP) in
+	// runc init (after applyCgroups) rather than in stage-1, so stage-1
+	// does not need to block on PrepareStage1 before spawning stage-2.
+	p.nsenterCfg.CloneFlags &^= unix.CLONE_NEWCGROUP
 
 	defer func() {
 		if retErr != nil {
@@ -989,6 +990,10 @@ func (p *initProcess) start() (retErr error) {
 		if err := applyCgroups(p.pid()); err != nil {
 			return err
 		}
+	}
+
+	if _, err := p.comm.initSockParent.Write([]byte{0}); err != nil {
+		return fmt.Errorf("error signaling cgroup ready to init process: %w", err)
 	}
 
 	var seenProcReady bool

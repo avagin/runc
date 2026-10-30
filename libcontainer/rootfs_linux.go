@@ -40,6 +40,7 @@ type mountConfig struct {
 	cgroup2Path     string
 	rootlessCgroups bool
 	cgroupns        bool
+	waitCgroupReady func() error
 }
 
 // mountEntry contains mount data specific to a mount point.
@@ -192,6 +193,7 @@ func prepareRootfs(pipe *syncSocket, iConfig *initConfig) (err error) {
 		cgroup2Path:     iConfig.Cgroup2Path,
 		rootlessCgroups: config.RootlessCgroups,
 		cgroupns:        config.Namespaces.Contains(configs.NEWCGROUP),
+		waitCgroupReady: iConfig.waitCgroupReady,
 	}
 	for _, m := range config.Mounts {
 		if err := setupAndMountToRootfs(pipe, config, mountConfig, m); err != nil {
@@ -203,6 +205,12 @@ func prepareRootfs(pipe *syncSocket, iConfig *initConfig) (err error) {
 	if setupDev {
 		if err := doSetupDev(rootFd, config); err != nil {
 			return fmt.Errorf("configuring container /dev: %w", err)
+		}
+	}
+
+	if iConfig.waitCgroupReady != nil {
+		if err := iConfig.waitCgroupReady(); err != nil {
+			return err
 		}
 	}
 
@@ -775,6 +783,11 @@ func mountToRootfs(c *mountConfig, m mountEntry) error {
 		}
 		return setRecAttr(m)
 	case "cgroup":
+		if c.waitCgroupReady != nil {
+			if err := c.waitCgroupReady(); err != nil {
+				return err
+			}
+		}
 		if cgroups.IsCgroup2UnifiedMode() {
 			return mountCgroupV2(m, c)
 		}

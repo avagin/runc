@@ -95,6 +95,8 @@ type initConfig struct {
 
 	// SpecState is filled in by [initProcess.Start].
 	SpecState *specs.State `json:"spec_state,omitempty"`
+
+	waitCgroupReady func() error
 }
 
 // Init is part of "runc init" implementation.
@@ -225,8 +227,29 @@ func startInitialization() (retErr error) {
 	}()
 
 	var config initConfig
-	if err := json.NewDecoder(initPipe).Decode(&config); err != nil {
+	dec := json.NewDecoder(initPipe)
+	if err := dec.Decode(&config); err != nil {
 		return err
+	}
+	if it == initStandard {
+		initTail := io.MultiReader(dec.Buffered(), initPipe)
+		done := false
+		config.waitCgroupReady = func() error {
+			if done {
+				return nil
+			}
+			done = true
+			var b [1]byte
+			if _, err := io.ReadFull(initTail, b[:]); err != nil {
+				return fmt.Errorf("waiting for cgroup setup: %w", err)
+			}
+			if config.Config.Namespaces.IsPrivate(configs.NEWCGROUP) {
+				if err := unix.Unshare(unix.CLONE_NEWCGROUP); err != nil {
+					return os.NewSyscallError("unshare(CLONE_NEWCGROUP)", err)
+				}
+			}
+			return nil
+		}
 	}
 
 	// If init succeeds, it will not return, hence none of the defers will be called.

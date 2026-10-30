@@ -558,7 +558,11 @@ func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 	cfg.Exe = safeExe
 	cfg.Args = []string{os.Args[0], "init"}
 	cfg.Dir = c.config.Rootfs
-	cfg.Env = append(os.Environ(), "GOMAXPROCS="+os.Getenv("GOMAXPROCS"))
+	cfg.Env = []string{
+		"GOMAXPROCS=1",
+		"GOGC=off",
+		"GODEBUG=containermaxprocs=0,updatemaxprocs=0",
+	}
 	cfg.ExtraFiles = append(cfg.ExtraFiles, p.ExtraFiles...)
 
 	addExtraFile := func(f *os.File, envName string) {
